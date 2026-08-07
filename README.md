@@ -1,5 +1,9 @@
 # Péon
 
+[![Tests](https://github.com/MaximeVigier/peon/actions/workflows/tests.yml/badge.svg)](https://github.com/MaximeVigier/peon/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
+
 Un agent orchestré par événements, local et indépendant du modèle utilisé
 (aucun fournisseur LLM concret n'est encore branché). Inspiré de Claude Code
 sans en être un clone.
