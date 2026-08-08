@@ -511,11 +511,11 @@ texte d'`ARCHITECTURE.md`, valables telles quelles) :**
 
 ## 6. État actuel d'implémentation
 
-**Implémenté et testé (337 tests, tous verts) :**
+**Implémenté et testé (344 tests, tous verts) :**
 
 ```
 src/peon/
-  __init__.py, cli.py                    # scaffold Phase 0 (peon --version)
+  __init__.py, cli.py                    # peon --version, peon run, peon resume (Phase 5)
   composition.py                         # build_runtime() : assemble un Runtime depuis un LLM concret
   models/
     mission.py, checkpoint.py, context.py, decision.py, action.py,
@@ -640,6 +640,43 @@ pour `resume_confirmation()`, fermeture de span garantie même sur exception,
 contrat `NoOpTracer` testé isolément), zéro régression sur les 328 tests
 préexistants (aucun modifié).
 
+Mise à jour ultérieure (Phase 5 — CLI minimale) : `cli.py` passe de
+`peon --version` seul à deux commandes réellement utilisables, `peon run
+"<goal>"` et `peon resume`, sans jamais réimplémenter la boucle ReAct — la
+CLI ne pilote que l'API publique du `Runtime` (`run`, `resume_confirmation`,
+`resume_mission`, `save_checkpoint`, `pending_confirmation`), construit son
+`Runtime` via `build_runtime()` (`composition.py`, inchangé) et n'importe ni
+`Reasoner`, ni `PolicyEngine`, ni `Executor`, ni `StateMachine` (vérifié par
+un test dédié qui inspecte l'AST du module). `peon run` gère les
+confirmations de façon synchrone et interactive (affichage `Tool`/
+`Arguments`/`Reason`, lecture `y`/`N` via `typer.confirm`, construction d'un
+vrai `ConfirmationResponse`, boucle jusqu'à l'état final pour couvrir
+plusieurs confirmations successives) et appelle `save_checkpoint(mission)`
+juste avant chaque demande — le point que `Runtime.save_checkpoint()`
+documentait déjà comme pertinent. `peon resume` s'appuie réellement sur le
+Checkpoint de la Phase 1 (`Storage.load_checkpoint()` ->
+`Runtime.resume_mission()` -> même boucle de confirmation que `run` si une
+confirmation est en attente) ; absence de checkpoint -> message clair et
+`exit_code=1`, pas d'exception brute. Configuration LLM volontairement
+minimale : options `--model`/`--base-url`/`--timeout-seconds` sur
+`OllamaLLM` (seul fournisseur existant), valeurs par défaut explicites en
+constantes de module (`llama3.1`, `http://localhost:11434`, `60s`) — pas de
+`.env`, pas de nouvelle couche de configuration. Deux limites assumées et
+documentées plutôt que masquées (voir **CLI** dans `ARCHITECTURE.md`) : (1)
+`InMemoryStorage` reste partagé en mémoire du process CLI (`cli._storage`),
+donc `peon resume` ne retrouve un Checkpoint que dans le même process, pas
+après un vrai redémarrage de `peon` ; (2) avec les trois `Tool` réels actuels
+(`LOW`/`LOW`/`MEDIUM`), aucun n'est `HIGH`, donc le chemin de confirmation
+n'est aujourd'hui jamais déclenché en usage réel — implémenté et testé via
+des `Tool` de test `HIGH`, prêt sans changement dès qu'un `Tool` `HIGH` réel
+existera. Compteur de tests : 337 -> 344 (7 nouveaux dans `tests/test_cli.py`
+: objectif accepté et mission résolue avec un LLM stub, chemin nominal avec
+action puis fin, confirmation acceptée avec reprise réelle de l'action,
+confirmation refusée avec comportement `Runtime` inchangé, `peon resume`
+sans checkpoint échoue proprement, `peon resume` retrouve et reprend un
+Checkpoint réel, absence de boucle ReAct dupliquée dans `cli.py`), zéro
+régression sur les 337 tests préexistants (aucun modifié).
+
 ## 7. État actuel — travail restant identifié
 
 Pas de phase suivante choisie ici — cette section décrit uniquement ce qui
@@ -648,7 +685,9 @@ reste absent aujourd'hui, sans engager de priorité :
 - Backend `Storage` persistant sur disque (SQLite ou autre) derrière
   l'abstraction déjà en place, pour les événements comme pour les checkpoints ;
   suivi incrémental de `persist_events()` pour éviter la duplication en cas
-  d'appels multiples.
+  d'appels multiples. Bloque concrètement `peon resume` (Phase 5) : avec le
+  seul `InMemoryStorage` disponible, un Checkpoint ne survit qu'au sein du
+  process CLI qui l'a créé, jamais à un vrai redémarrage de `peon`.
 - Reprise de Mission après arrêt du process : le cas ciblé par la Phase 1
   (`Checkpoint` + `Runtime.save_checkpoint()`/`resume_mission()`) est
   implémenté et testé — restauration de la `Mission` et d'une
@@ -656,19 +695,23 @@ reste absent aujourd'hui, sans engager de priorité :
   restauration de l'`EventLog`/des `Observation` (replay complet de
   l'historique de raisonnement, pas seulement de l'état mission/confirmation),
   reprise multi-mission, backend disque réel (voir point ci-dessus).
-- Tools concrets restants : `git.py`, `search.py`.
+- Tools concrets restants : `git.py`, `search.py` (aucun `Tool` `HIGH`
+  livré : voir la limite du chemin de confirmation notée en section 6,
+  Phase 5).
 - Connexion de `LLMReasoner`/`InvalidLLMResponseError` au Runtime.
-- CLI interactive capable de produire un vrai `ConfirmationResponse`
-  utilisateur (le mécanisme de reprise côté Runtime, lui, est déjà implémenté
-  et testé).
-- CLI au-delà de `peon --version`.
+- CLI au-delà de `run`/`resume` (Phase 5, terminée - voir section 4 et 6) :
+  pas de gestion dédiée des erreurs réseau Ollama (`OllamaRequestError`,
+  `InvalidLLMResponseError` remontent brutes), pas d'option
+  `--workspace-root`, pas de commande d'inspection d'un Checkpoint sans le
+  reprendre.
 - Sécurité au-delà de ce que couvre la Phase 3 (Policy/Guardrails, terminée -
   voir section 4 et 6) : `Workspace`/`LocalWorkspace` reste une indirection
   technique pure sans sandbox ni allowlist de commandes ni timeout shell (ces
   sujets restent hors périmètre, volontairement, cf. `ARCHITECTURE.md`) ;
   `PathRestrictionRule` existe mais n'est configurée par aucun appelant réel
-  aujourd'hui (`workspace_root` jamais fourni par `composition.py` ni une
-  CLI, qui n'existe pas encore) ; `ToolAuthorizationRule` ne distingue pas
+  aujourd'hui (`workspace_root` jamais fourni par `composition.py`, donc pas
+  non plus par `cli.py` qui construit son Runtime via `build_runtime()`) ;
+  `ToolAuthorizationRule` ne distingue pas
   « autorisé » de « enregistré » (pas de rôles/permissions par utilisateur ou
   mode d'exécution, voir section 5, point 28). Toute évolution en ce sens
   (ex. `DockerWorkspace`/`RemoteWorkspace`, autorisation plus fine que

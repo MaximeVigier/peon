@@ -43,6 +43,8 @@ systématiquement sa réponse avant d'agir. Voir
   défaut) : spans de durée autour de `run()`, `resume_confirmation()`, l'appel
   au Reasoner et l'appel à l'Executor. Séparé du vocabulaire métier, aucun
   couplage à l'`EventLog`.
+- **CLI** — `peon run "<goal>"` / `peon resume` (Typer). Pilote uniquement
+  l'API publique du Runtime, ne réimplémente jamais la boucle ReAct.
 
 ## Lancer en local
 
@@ -53,13 +55,18 @@ pip install -e ".[dev]"
 
 peon --version
 python -m pytest
+
+# necessite un serveur Ollama local (http://localhost:11434) avec le modele
+# choisi deja disponible (`ollama pull <model>`) :
+peon run "lister les fichiers du dossier courant" --model llama3.1
+peon resume   # reprend un Checkpoint sauvegarde plus tot DANS LE MEME PROCESS
 ```
 
 ## Structure
 
 ```
 src/peon/
-  cli.py               # point d'entree Typer (peon --version)
+  cli.py               # Typer : peon --version, peon run, peon resume (Phase 5)
   composition.py         # build_runtime() : assemble un Runtime pret a l'emploi
                           # a partir d'un LLM concret et d'une liste de Tool
   runtime.py            # orchestrateur : run(), resume_confirmation(),
@@ -132,7 +139,13 @@ tests/                           # miroir de src/peon/ (+ tests d'integration bo
   l'exécution d'un Tool (`executor.run`) via des spans techniques ; `NoOpTracer`
   par défaut, comportement strictement inchangé sans tracer, aucun couplage à
   l'`EventLog`.
-- 337 tests passants (unitaires + intégration bout en bout).
+- CLI minimale réellement utilisable (Phase 5) : `peon run "<goal>"` lance une
+  mission jusqu'à son état final en gérant les confirmations en direct
+  (affichage `Tool`/`Arguments`/`Reason`, réponse `y`/`N`, vrai
+  `ConfirmationResponse`) ; `peon resume` s'appuie sur le vrai mécanisme de
+  `Checkpoint` de la Phase 1. Construite exclusivement via `build_runtime()`,
+  ne réimplémente jamais la boucle ReAct.
+- 344 tests passants (unitaires + intégration bout en bout).
 
 ## Limitations actuelles
 
@@ -145,15 +158,30 @@ tests/                           # miroir de src/peon/ (+ tests d'integration bo
   disque n'est branché** — l'abstraction et le mécanisme de reprise sont en
   place (voir ci-dessus), mais `InMemoryStorage` ne persiste que pour la durée
   du process. Un backend disque (SQLite ou autre) reste une extension future
-  derrière la même abstraction `Storage`.
+  derrière la même abstraction `Storage`. **Conséquence concrète sur `peon
+  resume`** : la CLI garde un `InMemoryStorage` unique en mémoire du process
+  (partagé entre `run` et `resume`), donc `peon resume` ne retrouve un
+  Checkpoint que s'il a été sauvegardé **dans le même process** — pas après un
+  vrai redémarrage de `peon` depuis un terminal (chaque invocation est un
+  nouveau process). Aucune persistance disque n'a été ajoutée pour masquer
+  cette limite.
 - **Reprise de mission encore partielle** : le `Checkpoint` restaure la
   `Mission` et une éventuelle `ConfirmationRequest` en attente (le cas
   `AWAITING_CONFIRMATION`), mais pas l'historique complet de l'`EventLog` ni
   les `Observation` passées — un nouveau `Runtime` reprend avec un `EventLog`
   vierge, pas un replay complet. Pas de multi-mission : un `Runtime` ne
   retient qu'un `Checkpoint`/une confirmation en attente à la fois.
-- **CLI minimale** : seulement `peon --version` ; aucune commande d'exécution
-  de mission.
+- **CLI minimale** : `peon --version`, `peon run "<goal>"`, `peon resume` —
+  pas de sous-commandes de configuration, pas d'option `--workspace-root`
+  (donc `PathRestrictionRule` reste inutilisée en pratique), pas de gestion
+  dédiée des erreurs réseau Ollama (elles remontent brutes).
+- **Le chemin de confirmation de la CLI n'est pas encore déclenché en usage
+  réel** : les trois `Tool` livrés (`read_file`, `list_directory` en `LOW`,
+  `run_command` en `MEDIUM`) ne sont jamais `RiskLevel.HIGH`, seul niveau qui
+  déclenche `REQUIRES_CONFIRMATION`. Le code de confirmation de `peon run`/
+  `peon resume` est implémenté et testé (via des `Tool` de test `HIGH`), prêt
+  à s'activer sans changement dès qu'un `Tool` `HIGH` réel (ex. futur
+  `tools/git.py`) sera enregistré.
 - **Détection de commandes dangereuses volontairement minimale** : le Policy
   Engine est un moteur de règles composables (voir ci-dessus), mais la règle
   de détection elle-même ne reconnaît toujours qu'un seul motif (`rm -rf

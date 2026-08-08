@@ -199,7 +199,10 @@ délibéré de fail-closed pour un moteur de sécurité.
 Relation avec **Workspace** : `PathRestrictionRule` ne lit jamais
 `Workspace` pour connaître la racine autorisée — celle-ci est une donnée de
 configuration du `PolicyEngine` lui-même (`workspace_root`, un `Path` fourni
-par l'appelant, ex. futur `cli.py`). `Workspace` reste un port d'accès
+par l'appelant). Non configuré aujourd'hui par `cli.py` (Phase 5) :
+`build_runtime()` (`composition.py`) n'expose pas encore ce paramètre —
+reste un point ouvert, pas une régression de cette phase. `Workspace` reste
+un port d'accès
 technique pur (Phase 2), jamais consulté pour une décision de sécurité :
 `PolicyEngine` décide si un chemin est acceptable, `Workspace` ne fait que
 l'I/O une fois l'Action déjà validée.
@@ -279,7 +282,7 @@ allowlist de commandes, aucun timeout — ces sujets sont explicitement hors
 périmètre de la Phase 2 et appartiennent à une Phase 3 (sécurité) à venir.
 `build_runtime()` (`composition.py`) n'a pas eu besoin d'évoluer : il ne
 construit jamais lui-même les `Tool`, il se contente d'enregistrer des
-instances déjà construites — c'est l'appelant (tests, futur CLI) qui
+instances déjà construites — c'est l'appelant (tests, `cli.py`) qui
 instancie `LocalWorkspace()` et l'injecte dans chaque Tool avant de les
 passer à `build_runtime(tools=...)`.
 
@@ -385,6 +388,53 @@ Abstraction volontairement minimale : ni système de metrics/logging
 distribué, ni dépendance à OpenTelemetry à ce stade. Pensée pour qu'un futur
 adaptateur OpenTelemetry puisse s'y brancher (`Tracer`/`Span` comme port)
 sans réécriture du Runtime.
+
+### CLI
+Interface Typer minimale (`cli.py`, Phase 5) : `peon run "<goal>"` et
+`peon resume`, en plus de `peon --version` déjà existant. Pilote uniquement
+l'API publique du **Runtime** (`run`, `resume_confirmation`,
+`resume_mission`, `save_checkpoint`, `pending_confirmation`) — ne connaît ni
+`Reasoner`, ni `PolicyEngine`, ni `Executor`, ni `StateMachine`, ne
+réimplémente jamais la boucle ReAct. Construit son `Runtime` exclusivement
+via `build_runtime()` (`composition.py`, inchangé).
+
+`peon run` reste synchrone et entièrement interactif : si une
+`AWAITING_CONFIRMATION` survient, la CLI affiche `Tool`/`Arguments`/`Reason`,
+lit un `y`/`N` (`typer.confirm`), construit un vrai `ConfirmationResponse` et
+appelle `resume_confirmation()` — en boucle jusqu'à un état final, puisqu'une
+même Mission peut déclencher plusieurs confirmations successives. Avant de
+demander la confirmation, elle appelle `save_checkpoint(mission)` — le point
+que `Runtime.save_checkpoint()` documente lui-même comme pertinent.
+
+`peon resume` s'appuie réellement sur le mécanisme de **Checkpoint** de la
+Phase 1 : `Storage.load_checkpoint()`, puis `Runtime.resume_mission()`, puis
+la même boucle de confirmation interactive que `run` si une confirmation est
+en attente. Aucune nouvelle logique de reprise.
+
+Configuration LLM volontairement minimale (pas de `.env`, pas de couche de
+configuration) : options `--model`/`--base-url`/`--timeout-seconds` sur
+`OllamaLLM`, seul fournisseur `LLM` concret existant, avec des valeurs par
+défaut explicites (`llama3.1`, `http://localhost:11434`, `60s`) codées en
+constantes de module.
+
+**Limite assumée du `Storage`** : la CLI garde un unique `InMemoryStorage`
+en mémoire du process (`cli._storage`), partagé entre `run` et `resume`.
+Cela permet à `peon resume` de retrouver un Checkpoint sauvegardé plus tôt
+**dans le même process** (utile pour les tests, ou une future intégration
+dans un process long-vivant), mais **pas** après un vrai redémarrage du
+process `peon` (chaque invocation shell de `peon` est un nouveau process
+Python, donc un `InMemoryStorage` vide) — aucune persistance disque n'a été
+fabriquée pour masquer cette limite ; un futur backend `Storage` la lèverait
+sans changer `cli.py`.
+
+**Limite assumée du chemin de confirmation** : avec les trois `Tool` réels
+existants (`read_file`, `list_directory` en `LOW`, `run_command` en
+`MEDIUM`), `RiskLevelRule` ne déclenche jamais `REQUIRES_CONFIRMATION` en
+usage réel — seul un `Tool` `HIGH` le ferait, et aucun n'est encore livré
+(voir **Hors périmètre du MVP** : `tools/git.py` reste à écrire). Le chemin
+de confirmation de la CLI est implémenté et testé (via des `Tool` de test
+`HIGH`), prêt à s'activer sans changement dès qu'un `Tool` réel `HIGH` sera
+enregistré.
 
 ## Points d'extension (non implémentés dans le MVP)
 
@@ -712,7 +762,9 @@ peon/
 ├── .gitignore
 ├── src/peon/
 │   ├── __init__.py
-│   ├── cli.py              # point d'entree Typer (peon --version)
+│   ├── cli.py              # CLI Typer minimale (Phase 5) : peon --version, peon run,
+│   │                        # peon resume -- pilote Runtime.run/resume_confirmation/
+│   │                        # resume_mission/save_checkpoint, jamais la boucle ReAct
 │   ├── composition.py      # build_runtime() : assemble un Runtime a partir d'un LLM concret
 │   │                        # et d'une liste de Tool, sans coupler Runtime a un fournisseur
 │   ├── runtime.py          # orchestrateur impur : appelle context_builder/reasoner/executor,

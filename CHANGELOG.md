@@ -4,6 +4,34 @@
 
 ### Added
 
+- `cli.py` (Phase 5 - CLI minimale) : `peon run "<goal>"` et `peon resume`,
+  en plus de `peon --version` deja existant. Construit son `Runtime`
+  exclusivement via `build_runtime()` (`composition.py`, inchange), ne
+  reimplemente jamais la boucle ReAct - pilote uniquement l'API publique du
+  Runtime (`run`, `resume_confirmation`, `resume_mission`, `save_checkpoint`,
+  `pending_confirmation`), verifie par un test qui inspecte l'AST du module
+  (aucune reference a `Reasoner`/`PolicyEngine`/`Executor`/`StateMachine`).
+  `peon run` gere les confirmations en direct (affichage `Tool`/`Arguments`/
+  `Reason`, lecture `y`/`N` via `typer.confirm`, `ConfirmationResponse` reel,
+  boucle jusqu'a l'etat final). `peon resume` s'appuie reellement sur le
+  Checkpoint de la Phase 1 (`Storage.load_checkpoint()` ->
+  `Runtime.resume_mission()` -> meme boucle de confirmation si necessaire) ;
+  absence de checkpoint -> message clair, `exit_code=1`. Configuration LLM
+  minimale et explicite (`--model`/`--base-url`/`--timeout-seconds` sur
+  `OllamaLLM`, valeurs par defaut en constantes de module) - pas de `.env`,
+  pas de nouvelle couche de configuration. Deux limites documentees plutot
+  que masquees : `InMemoryStorage` du process CLI ne permet a `peon resume`
+  de retrouver un Checkpoint que dans le meme process, pas apres un vrai
+  redemarrage ; aucun `Tool` reel livre n'est `RiskLevel.HIGH` aujourd'hui,
+  donc le chemin de confirmation (implemente et teste) ne se declenche pas
+  encore en usage reel.
+- `tests/test_cli.py` (7 nouveaux tests) : objectif accepte et mission
+  resolue avec un LLM stub, chemin nominal action puis fin, confirmation
+  acceptee avec reprise reelle de l'action, confirmation refusee avec
+  comportement `Runtime` inchange, `peon resume` sans checkpoint echoue
+  proprement, `peon resume` retrouve et reprend un Checkpoint reel, absence
+  de boucle ReAct dupliquee dans `cli.py`.
+
 - `tracing.py` (Phase 4 - Observability / tracing technique) : port
   d'observabilite minimal, separe du vocabulaire metier - `Tracer`/`Span`
   (ABC) + `NoOpTracer` par defaut. `Tracer.start_span(name, **attributes)`
@@ -72,7 +100,7 @@
 
 ### Tests
 
-337 passing
+344 passing
 
 ## 0.1.0
 
