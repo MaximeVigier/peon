@@ -1,9 +1,9 @@
-import subprocess
 from typing import Any
 
 from peon.models.tool_result import ToolResult
 from peon.models.tool_spec import RiskLevel, ToolSpec
 from peon.tools.base import Tool
+from peon.workspace import Workspace
 
 _RUN_COMMAND_SPEC = ToolSpec(
     name="run_command",
@@ -18,6 +18,9 @@ _RUN_COMMAND_SPEC = ToolSpec(
 
 
 class ShellTool(Tool):
+    def __init__(self, workspace: Workspace) -> None:
+        self._workspace = workspace
+
     @property
     def spec(self) -> ToolSpec:
         return _RUN_COMMAND_SPEC
@@ -31,16 +34,16 @@ class ShellTool(Tool):
             )
 
         try:
-            completed = subprocess.run(command, shell=True, capture_output=True, text=True)
+            result = self._workspace.run_command(command)
         except OSError as exc:
             return ToolResult(success=False, error=f"execution de '{command}' impossible : {exc}")
 
-        if completed.returncode != 0:
-            error = completed.stderr.strip() or f"la commande a echoue avec le code {completed.returncode}"
-            return ToolResult(success=False, error=error, return_code=completed.returncode)
+        if result.return_code != 0:
+            error = result.stderr.strip() or f"la commande a echoue avec le code {result.return_code}"
+            return ToolResult(success=False, error=error, return_code=result.return_code)
 
         return ToolResult(
             success=True,
-            output={"stdout": completed.stdout, "stderr": completed.stderr},
+            output={"stdout": result.stdout, "stderr": result.stderr},
             return_code=0,
         )

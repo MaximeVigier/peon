@@ -78,6 +78,8 @@ src/peon/
     base.py                 # contrat Tool (ABC)
     filesystem.py             # ReadFileTool (read_file), ListDirectoryTool (list_directory)
     shell.py                   # ShellTool (run_command)
+  workspace.py                # Workspace (ABC) + LocalWorkspace : port technique
+                               # filesystem/subprocess injecte dans les Tools ci-dessus
   models/                       # schemas Pydantic partages entre composants
                                  # (dont checkpoint.py : Mission + ConfirmationRequest)
 tests/                           # miroir de src/peon/ (+ tests d'integration bout-en-bout)
@@ -109,8 +111,10 @@ tests/                           # miroir de src/peon/ (+ tests d'integration bo
   `composition.py` (`build_runtime()`).
 - Trois Tools concrets : `read_file`, `list_directory` (lecture seule, `LOW`),
   `run_command` (exécution shell arbitraire, `MEDIUM` — la sécurité reste
-  entièrement au Policy Engine, jamais filtrée par le Tool lui-même).
-- 289 tests passants (unitaires + intégration bout en bout).
+  entièrement au Policy Engine, jamais filtrée par le Tool lui-même). Chacun
+  délègue l'accès technique au filesystem/`subprocess` à un `Workspace`
+  injecté (`LocalWorkspace` aujourd'hui).
+- 295 tests passants (unitaires + intégration bout en bout).
 
 ## Limitations actuelles
 

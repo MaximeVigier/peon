@@ -11,6 +11,7 @@ from peon.reasoner import Reasoner
 from peon.runtime import Runtime
 from peon.tool_registry import ToolRegistry
 from peon.tools.shell import ShellTool
+from peon.workspace import LocalWorkspace
 
 
 class _RunCommandThenFinishReasoner(Reasoner):
@@ -33,7 +34,7 @@ class _RunCommandThenFinishReasoner(Reasoner):
 
 def test_full_cycle_runs_a_real_command_through_every_component() -> None:
     registry = ToolRegistry()
-    registry.register(ShellTool())
+    registry.register(ShellTool(LocalWorkspace()))
     event_log = EventLog()
     runtime = Runtime(
         context_builder=ContextBuilder(registry),
@@ -74,7 +75,7 @@ def test_full_cycle_runs_a_real_command_through_every_component() -> None:
 
 def test_full_cycle_reports_a_failing_command_as_an_execution_error() -> None:
     registry = ToolRegistry()
-    registry.register(ShellTool())
+    registry.register(ShellTool(LocalWorkspace()))
     runtime = Runtime(
         context_builder=ContextBuilder(registry),
         reasoner=_RunCommandThenFinishReasoner("exit 1"),

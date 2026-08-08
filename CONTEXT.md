@@ -84,7 +84,8 @@ plusieurs composants d'un coup ni anticiper une phase non demandée.
 | **Policy Engine** | Fonction pure `(Action) -> Verdict`. Consulte le Tool Registry (métadonnées uniquement). Détecte les commandes dangereuses, déclenche la confirmation. | ✅ implémenté (`policy.py`) |
 | **Executor** | Exécute une Action déjà validée via le Tool résolu par le Tool Registry ; convertit les échecs en `ExecutionError`. Ne parle jamais au LLM ni au Policy Engine. | ✅ implémenté (`executor.py`) |
 | **Tool Registry** | Source de vérité unique sur les outils disponibles (instances `Tool` exécutables, pas seulement leur description). | ✅ implémenté (`tool_registry.py`) |
-| **Tool** | Contrat d'une capacité atomique : `spec` (ToolSpec) + `execute(arguments) -> ToolResult`. | ✅ contrat implémenté (`tools/base.py`) — implémentations concrètes : `ReadFileTool` (`read_file`, `LOW`), `ListDirectoryTool` (`list_directory`, `LOW`), dans `tools/filesystem.py` ; `ShellTool` (`run_command`, `MEDIUM`), dans `tools/shell.py` ; **restent à faire** `git.py`/`search.py` |
+| **Tool** | Contrat d'une capacité atomique : `spec` (ToolSpec) + `execute(arguments) -> ToolResult`. | ✅ contrat implémenté (`tools/base.py`) — implémentations concrètes : `ReadFileTool` (`read_file`, `LOW`), `ListDirectoryTool` (`list_directory`, `LOW`), dans `tools/filesystem.py` ; `ShellTool` (`run_command`, `MEDIUM`), dans `tools/shell.py` ; toutes trois injectées avec un `Workspace` depuis la Phase 2 (délèguent l'I/O, ne touchent plus `pathlib`/`subprocess` directement) ; **restent à faire** `git.py`/`search.py` |
+| **Workspace** | Port technique entre les Tools et le filesystem/processus réels : `read_file`, `list_directory`, `run_command`. Interface réduite aux seules opérations dont les Tools actuels ont besoin. | ✅ implémenté (`workspace.py`, Phase 2) — une seule implémentation concrète, `LocalWorkspace` (aucun sandboxing, aucune restriction de chemin) |
 | **Observation** | Modèle plat (`kind` + `summary` + `details`), sans dépendance vers ToolResult/ExecutionError/Verdict ni aucun composant — la traduction elle-même reste une responsabilité du Runtime. Le Reasoner ne voit jamais un ToolResult brut. | ✅ implémenté (`models/observation.py`), produite en conditions réelles par le `Runtime` |
 | **Event Log** | Journal append-only en mémoire pendant l'exécution (`append`, `list_events`, `list_events_by_type`), zéro dépendance vers Storage. | ✅ implémenté (`event_log.py`) |
 | **Storage** | Abstraction `save_events`/`load_events` + `save_checkpoint`/`load_checkpoint` (ABC), zéro dépendance vers Event Log ni logique métier au-delà de `Event`/`Checkpoint`. | ✅ abstraction + `InMemoryStorage` implémentées (`storage.py`) — **aucun backend disque** (SQLite ou autre) pour l'instant, y compris pour les checkpoints |
@@ -281,6 +282,36 @@ texte d'`ARCHITECTURE.md`, valables telles quelles) :**
   `self._pending_confirmation` et retourner la `Mission` : aucune duplication
   de la boucle ReAct, aucune I/O, réutilise entièrement `resume_confirmation()`
   déjà existant pour la suite du cycle.
+- **Workspace / `LocalWorkspace`** (Phase 2, `workspace.py`,
+  `tools/filesystem.py`, `tools/shell.py`) : indirection technique pure
+  (`Runtime -> Executor -> Tool -> Workspace -> filesystem/subprocess`), pas
+  encore un système de sandboxing — délibérément hors périmètre de cette
+  phase (voir point ouvert correspondant). Interface `Workspace` (ABC)
+  déduite du code existant plutôt que dessinée a priori : trois méthodes
+  seulement (`read_file`, `list_directory`, `run_command`), une par
+  opération technique réellement utilisée par `ReadFileTool`,
+  `ListDirectoryTool`, `ShellTool`. `run_command` retourne un `CommandResult`
+  (`NamedTuple` : `stdout`/`stderr`/`return_code`), pas un
+  `subprocess.CompletedProcess` réexposé tel quel, pour ne pas fuiter un type
+  de la stdlib à travers le port. Chaque méthode laisse remonter les mêmes
+  exceptions que l'implémentation d'origine (`OSError`,
+  `UnicodeDecodeError`) : c'est toujours le Tool appelant qui les capture et
+  les traduit en `ToolResult`, comportement strictement inchangé.
+  `LocalWorkspace` reproduit exactement l'ancien code (`Path.read_text`,
+  `Path.iterdir`, `subprocess.run(..., shell=True, capture_output=True,
+  text=True)`), y compris son absence de tri : le tri des entrées de
+  répertoire reste une responsabilité de `ListDirectoryTool` (logique de
+  présentation), pas du Workspace (accès technique brut) — c'est le seul
+  point où le découpage aurait pu se faire autrement. Les trois Tools
+  reçoivent désormais un `Workspace` obligatoire au constructeur
+  (`ReadFileTool(workspace)`, etc.), sans valeur par défaut : décision
+  délibérée pour que l'injection reste explicite à chaque site de
+  construction (tests, `build_runtime`), plutôt qu'un `LocalWorkspace()`
+  implicite qui masquerait la dépendance. `build_runtime()`
+  (`composition.py`) n'a pas eu besoin d'évoluer — il ne construit jamais les
+  `Tool` lui-même, seulement le `ToolRegistry` à partir d'instances déjà
+  construites par l'appelant. `PolicyEngine`, `Executor`, `StateMachine`,
+  `EventLog`, `Storage`/`Checkpoint` : aucun n'a été touché par cette phase.
 
 ## 5. Points volontairement laissés ouverts
 
@@ -336,10 +367,10 @@ texte d'`ARCHITECTURE.md`, valables telles quelles) :**
     devra être portée dans `details` par le Runtime. À séparer en un kind
     dédié plus tard si besoin, ou rester ainsi ?
 19. Aucune restriction de chemin dans `ReadFileTool`/`ListDirectoryTool`
-    (volontaire, hors périmètre de leur phase respective) : un futur Policy
-    Engine devra décider s'il borne les chemins accessibles (sandbox projet,
-    refus des chemins absolus/`~`...), sans que cela ne remonte dans le Tool
-    lui-même — non conçu, non implémenté.
+    (volontaire, hors périmètre de leur phase respective) : depuis la Phase 2,
+    le point d'insertion naturel d'une telle restriction serait `Workspace`
+    (ou un futur `PolicyEngine` consulté en amont), pas le Tool lui-même —
+    toujours non conçu, non implémenté (Phase 3, sécurité).
 20. Format d'`output` des Tools filesystem non uniformisé : `ReadFileTool`
     retourne une chaîne (contenu brut), `ListDirectoryTool` une liste triée de
     noms (`list[str]`), sans distinguer fichier/dossier ni exposer de
@@ -398,7 +429,7 @@ texte d'`ARCHITECTURE.md`, valables telles quelles) :**
 
 ## 6. État actuel d'implémentation
 
-**Implémenté et testé (289 tests, tous verts) :**
+**Implémenté et testé (295 tests, tous verts) :**
 
 ```
 src/peon/
@@ -411,7 +442,11 @@ src/peon/
   tools/
     base.py                              # contrat Tool (ABC)
     filesystem.py                        # ReadFileTool (read_file), ListDirectoryTool (list_directory)
+                                          # -- injectees avec un Workspace (Phase 2)
     shell.py                             # ShellTool (run_command, RiskLevel.MEDIUM)
+                                          # -- injecte avec un Workspace (Phase 2)
+  workspace.py                           # Workspace (ABC) + LocalWorkspace (Phase 2) :
+                                          # port technique filesystem/subprocess pour les Tools
   providers/
     ollama.py                            # OllamaLLM : premier fournisseur LLM concret
   tool_registry.py                       # enregistre des Tool, pas seulement des ToolSpec
@@ -477,6 +512,14 @@ tests de checkpoint ajoutés), documentation d'`OllamaLLM`/`composition.py`
 (déjà présents dans le code mais jamais reflétés ici), et documentation du
 nouveau `Checkpoint`/mécanisme de reprise.
 
+Mise à jour ultérieure (Phase 2 — Workspace) : introduction du port
+`Workspace`/`LocalWorkspace` (`workspace.py`) entre les Tools et le
+filesystem/`subprocess` réels, migration de `ReadFileTool`,
+`ListDirectoryTool` et `ShellTool` pour déléguer à un `Workspace` injecté au
+constructeur plutôt que d'appeler `pathlib`/`subprocess` directement,
+comportement fonctionnel strictement inchangé. Compteur de tests : 289 ->
+295 (6 nouveaux tests dans `tests/test_workspace.py`).
+
 ## 7. État actuel — travail restant identifié
 
 Pas de phase suivante choisie ici — cette section décrit uniquement ce qui
@@ -499,6 +542,12 @@ reste absent aujourd'hui, sans engager de priorité :
   utilisateur (le mécanisme de reprise côté Runtime, lui, est déjà implémenté
   et testé).
 - CLI au-delà de `peon --version`.
+- Sécurité au niveau `Workspace` (Phase 3, non commencée) : le port
+  `Workspace`/`LocalWorkspace` introduit en Phase 2 est une indirection
+  technique pure — pas de restriction de chemins, pas de sandbox, pas
+  d'allowlist de commandes, pas de timeout shell. Toute évolution en ce sens
+  (ex. `DockerWorkspace`/`RemoteWorkspace`, validation d'arguments
+  supplémentaire) reste à concevoir.
 
 Une nouvelle session doit **demander à l'utilisateur** quelle est la
 prochaine étape plutôt que d'en choisir une — conformément à la méthode de

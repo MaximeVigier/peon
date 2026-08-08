@@ -1,9 +1,9 @@
-from pathlib import Path
 from typing import Any
 
 from peon.models.tool_result import ToolResult
 from peon.models.tool_spec import RiskLevel, ToolSpec
 from peon.tools.base import Tool
+from peon.workspace import Workspace
 
 _READ_FILE_SPEC = ToolSpec(
     name="read_file",
@@ -33,6 +33,9 @@ def _missing_or_invalid_path_result() -> ToolResult:
 
 
 class ReadFileTool(Tool):
+    def __init__(self, workspace: Workspace) -> None:
+        self._workspace = workspace
+
     @property
     def spec(self) -> ToolSpec:
         return _READ_FILE_SPEC
@@ -43,7 +46,7 @@ class ReadFileTool(Tool):
             return _missing_or_invalid_path_result()
 
         try:
-            content = Path(path).read_text(encoding="utf-8")
+            content = self._workspace.read_file(path)
         except OSError as exc:
             return ToolResult(success=False, error=f"lecture de '{path}' impossible : {exc}")
         except UnicodeDecodeError as exc:
@@ -53,6 +56,9 @@ class ReadFileTool(Tool):
 
 
 class ListDirectoryTool(Tool):
+    def __init__(self, workspace: Workspace) -> None:
+        self._workspace = workspace
+
     @property
     def spec(self) -> ToolSpec:
         return _LIST_DIRECTORY_SPEC
@@ -63,7 +69,7 @@ class ListDirectoryTool(Tool):
             return _missing_or_invalid_path_result()
 
         try:
-            entries = sorted(entry.name for entry in Path(path).iterdir())
+            entries = sorted(self._workspace.list_directory(path))
         except OSError as exc:
             return ToolResult(success=False, error=f"lecture du dossier '{path}' impossible : {exc}")
 

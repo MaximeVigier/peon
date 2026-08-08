@@ -168,12 +168,47 @@ Implémentations concrètes existantes : `ReadFileTool` (`read_file`, risque
 `LOW`) et `ListDirectoryTool` (`list_directory`, risque `LOW`), toutes deux
 dans `tools/filesystem.py` — lecture seule, aucun effet de bord ; `ShellTool`
 (`run_command`, risque `MEDIUM`), dans `tools/shell.py` — exécute une commande
-shell arbitraire via `subprocess`. Un Tool n'implémente jamais de filtrage de
-sécurité lui-même (pas de whitelist, pas de refus de commande) : cette
-responsabilité appartient exclusivement au Policy Engine, y compris pour
-`run_command` (dont le `risk_level` `MEDIUM`, combiné à la détection de motifs
-dangereux du Policy Engine, est le mécanisme retenu plutôt qu'un `HIGH`
-systématique — voir **Policy Engine** ci-dessus).
+shell arbitraire. Un Tool n'implémente jamais de filtrage de sécurité
+lui-même (pas de whitelist, pas de refus de commande) : cette responsabilité
+appartient exclusivement au Policy Engine, y compris pour `run_command` (dont
+le `risk_level` `MEDIUM`, combiné à la détection de motifs dangereux du Policy
+Engine, est le mécanisme retenu plutôt qu'un `HIGH` systématique — voir
+**Policy Engine** ci-dessus).
+
+Depuis la Phase 2 (Workspace), aucun de ces trois Tools n'accède plus
+directement au filesystem ou à `subprocess` : chacun reçoit un **Workspace**
+injecté au constructeur (`ReadFileTool(workspace)`,
+`ListDirectoryTool(workspace)`, `ShellTool(workspace)`) et lui délègue
+l'opération technique (`read_file`/`list_directory`/`run_command`). Le Tool
+garde la responsabilité métier — validation des arguments, choix du message
+d'erreur, construction du `ToolResult` — le Workspace ne fait que l'I/O brute.
+Ce découplage ne change ni le comportement observable ni le contrat
+`Tool.execute(arguments) -> ToolResult`.
+
+### Workspace
+Port technique introduit en Phase 2 (`workspace.py`), interposé entre les
+Tools et le filesystem/processus réels : `Runtime → Executor → Tool →
+Workspace → filesystem/subprocess`. Interface `Workspace` (ABC) réduite aux
+trois opérations réellement utilisées par les Tools actuels — `read_file(path)
+-> str`, `list_directory(path) -> list[str]`, `run_command(command) ->
+CommandResult` (`NamedTuple` : `stdout`, `stderr`, `return_code`) — plutôt
+qu'une API large anticipant des besoins non encore exprimés. Chaque méthode
+laisse remonter telles quelles les exceptions du comportement d'origine
+(`OSError`, `UnicodeDecodeError`) : c'est toujours le Tool appelant qui les
+capture et les traduit en `ToolResult`, exactement comme avant l'introduction
+de cette indirection.
+
+`LocalWorkspace`, seule implémentation concrète à ce jour, reproduit
+exactement l'ancien comportement des Tools (`pathlib.Path.read_text`,
+`Path.iterdir`, `subprocess.run(..., shell=True, capture_output=True,
+text=True)`) : aucun sandboxing, aucune restriction de chemin, aucune
+allowlist de commandes, aucun timeout — ces sujets sont explicitement hors
+périmètre de la Phase 2 et appartiennent à une Phase 3 (sécurité) à venir.
+`build_runtime()` (`composition.py`) n'a pas eu besoin d'évoluer : il ne
+construit jamais lui-même les `Tool`, il se contente d'enregistrer des
+instances déjà construites — c'est l'appelant (tests, futur CLI) qui
+instancie `LocalWorkspace()` et l'injecte dans chaque Tool avant de les
+passer à `build_runtime(tools=...)`.
 
 ### Observation
 Modèle implémenté (`models/observation.py`) : `kind` (`ObservationKind` —
@@ -287,6 +322,7 @@ graph TD
     Exec["Executor"]
     TR["Tool Registry"]
     Tools["Tools"]
+    WS["Workspace<br/>(interface + LocalWorkspace)"]
     EL["Event Log<br/>(mémoire)"]
     ST["Storage<br/>(interface + InMemoryStorage)"]
 
@@ -304,6 +340,7 @@ graph TD
     Exec --> TR
     Exec --> Tools
     TR --> Tools
+    Tools --> WS
 ```
 
 ### Séquence — un cycle complet
@@ -319,6 +356,7 @@ sequenceDiagram
     participant PE as Policy Engine
     participant EX as Executor
     participant T as Tool
+    participant WS as Workspace
     participant ST as Storage
 
     RT->>EL: append(MissionCreated)
@@ -347,6 +385,8 @@ sequenceDiagram
             EX->>TR: resolve(tool_name)
             TR-->>EX: Tool
             EX->>T: run(parameters)
+            T->>WS: delegue l'operation technique
+            WS-->>T: resultat brut / exception
             T-->>EX: ToolResult
             EX-->>RT: ToolResult
             RT->>RT: construit Observation
@@ -414,6 +454,7 @@ graph LR
 
     policy --> tool_registry
     tool_registry --> tools
+    tools --> workspace[workspace.py]
 
     state_machine --> models[models/]
     context_builder --> models
@@ -426,7 +467,8 @@ graph LR
 
 Aucune dépendance circulaire : `runtime.py` dépend de tout, rien ne dépend de
 lui ; `event_log.py` et `storage.py` ne dépendent l'un de l'autre ni dans un
-sens ni dans l'autre.
+sens ni dans l'autre. `workspace.py` ne dépend d'aucun autre module `peon.*`
+(uniquement `pathlib`/`subprocess` de la stdlib) ; seul `tools/` en dépend.
 
 ## Machine d'états — table détaillée
 
@@ -579,6 +621,8 @@ peon/
 │   │                        # checkpoints), pas de backend disque
 │   ├── llm.py              # abstraction fournisseur LLM (ABC)
 │   ├── prompts.py          # PromptBuilder : Context -> messages LLM
+│   ├── workspace.py        # abstraction Workspace (ABC) + LocalWorkspace :
+│   │                        # port technique filesystem/subprocess pour les Tools
 │   │
 │   ├── providers/
 │   │   ├── __init__.py
@@ -588,7 +632,8 @@ peon/
 │   │   ├── __init__.py
 │   │   ├── base.py
 │   │   ├── filesystem.py   # ReadFileTool (read_file, LOW), ListDirectoryTool (list_directory, LOW)
-│   │   └── shell.py        # ShellTool (run_command, MEDIUM)
+│   │   │                    # -- toutes deux injectees avec un Workspace
+│   │   └── shell.py        # ShellTool (run_command, MEDIUM) -- injecte avec un Workspace
 │   │
 │   └── models/              # schemas Pydantic partages entre composants
 │       ├── __init__.py

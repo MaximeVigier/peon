@@ -13,6 +13,7 @@ from peon.reasoner import Reasoner
 from peon.runtime import Runtime
 from peon.tool_registry import ToolRegistry
 from peon.tools.filesystem import ReadFileTool
+from peon.workspace import LocalWorkspace
 
 
 class _ReadThenFinishReasoner(Reasoner):
@@ -39,7 +40,7 @@ def test_full_cycle_reads_a_real_file_through_every_component(tmp_path: Path) ->
     target.write_text("contenu reel du fichier", encoding="utf-8")
 
     registry = ToolRegistry()
-    registry.register(ReadFileTool())
+    registry.register(ReadFileTool(LocalWorkspace()))
     event_log = EventLog()
     runtime = Runtime(
         context_builder=ContextBuilder(registry),
@@ -82,7 +83,7 @@ def test_full_cycle_reports_a_missing_file_as_an_execution_error(tmp_path: Path)
     missing = tmp_path / "absent.txt"
 
     registry = ToolRegistry()
-    registry.register(ReadFileTool())
+    registry.register(ReadFileTool(LocalWorkspace()))
     runtime = Runtime(
         context_builder=ContextBuilder(registry),
         reasoner=_ReadThenFinishReasoner(str(missing)),

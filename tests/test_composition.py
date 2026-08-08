@@ -13,6 +13,7 @@ from peon.providers.ollama import OllamaConfig, OllamaLLM
 from peon.runtime import StorageNotConfiguredError
 from peon.storage import InMemoryStorage
 from peon.tools.filesystem import ReadFileTool
+from peon.workspace import LocalWorkspace
 
 from conftest import FakeOllamaHandler
 
@@ -47,7 +48,7 @@ def test_build_runtime_wires_a_working_runtime_with_any_llm(tmp_path: Path) -> N
     target.write_text("contenu reel du fichier", encoding="utf-8")
 
     llm = _ScriptedLLM(_read_then_finish_responses(str(target)))
-    runtime = build_runtime(llm=llm, tools=[ReadFileTool()])
+    runtime = build_runtime(llm=llm, tools=[ReadFileTool(LocalWorkspace())])
 
     mission = runtime.run(f"lire le contenu de {target.name}")
 
@@ -66,7 +67,7 @@ def test_build_runtime_works_with_ollama_llm_without_real_network(fake_ollama_se
 
     host, port = fake_ollama_server.server_address
     llm = OllamaLLM(OllamaConfig(model="llama3", base_url=f"http://{host}:{port}"))
-    runtime = build_runtime(llm=llm, tools=[ReadFileTool()])
+    runtime = build_runtime(llm=llm, tools=[ReadFileTool(LocalWorkspace())])
 
     mission = runtime.run("verifier la disponibilite du provider Ollama")
 

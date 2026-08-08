@@ -13,6 +13,7 @@ from peon.reasoner import Reasoner
 from peon.runtime import Runtime
 from peon.tool_registry import ToolRegistry
 from peon.tools.filesystem import ReadFileTool
+from peon.workspace import LocalWorkspace
 
 _CONFIG_CONTENT = (
     "[server]\n"
@@ -78,7 +79,7 @@ def test_full_cycle_reads_a_config_file_and_confirms_its_content(tmp_path: Path)
     config_file.write_text(_CONFIG_CONTENT, encoding="utf-8")
 
     registry = ToolRegistry()
-    registry.register(ReadFileTool())
+    registry.register(ReadFileTool(LocalWorkspace()))
     event_log = EventLog()
     runtime = Runtime(
         context_builder=ContextBuilder(registry),

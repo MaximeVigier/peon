@@ -15,10 +15,18 @@
   un nouveau `Runtime` peut restaurer la `Mission` et la confirmation en
   attente d'un `Checkpoint` charge, puis reprendre via
   `resume_confirmation()` deja existant, sans dupliquer la boucle ReAct.
+- `Workspace` (ABC) / `LocalWorkspace` (`workspace.py`, Phase 2 - migration
+  filesystem/shell) : port technique entre les Tools et le filesystem/
+  subprocess reels (`read_file`, `list_directory`, `run_command`).
+  `ReadFileTool`, `ListDirectoryTool`, `ShellTool` recoivent desormais ce
+  `Workspace` par injection au constructeur et ne font plus d'appel direct a
+  `pathlib`/`subprocess` ; comportement fonctionnel strictement inchange
+  (pas de sandboxing, pas de restriction de chemins, pas de timeout - hors
+  perimetre de cette phase).
 
 ### Tests
 
-289 passing
+295 passing
 
 ## 0.1.0
 

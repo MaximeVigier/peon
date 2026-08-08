@@ -13,6 +13,7 @@ from peon.reasoner import Reasoner
 from peon.runtime import Runtime
 from peon.tool_registry import ToolRegistry
 from peon.tools.filesystem import ListDirectoryTool
+from peon.workspace import LocalWorkspace
 
 
 class _ListThenFinishReasoner(Reasoner):
@@ -39,7 +40,7 @@ def test_full_cycle_lists_a_real_directory_through_every_component(tmp_path: Pat
     (tmp_path / "b.txt").write_text("b", encoding="utf-8")
 
     registry = ToolRegistry()
-    registry.register(ListDirectoryTool())
+    registry.register(ListDirectoryTool(LocalWorkspace()))
     assert registry.exists("list_directory")
 
     event_log = EventLog()
@@ -84,7 +85,7 @@ def test_full_cycle_reports_a_missing_directory_as_an_execution_error(tmp_path: 
     missing = tmp_path / "absent"
 
     registry = ToolRegistry()
-    registry.register(ListDirectoryTool())
+    registry.register(ListDirectoryTool(LocalWorkspace()))
     runtime = Runtime(
         context_builder=ContextBuilder(registry),
         reasoner=_ListThenFinishReasoner(str(missing)),
