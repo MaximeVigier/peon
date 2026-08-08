@@ -5,8 +5,9 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
 
 Un agent orchestré par événements, local et indépendant du modèle utilisé
-(aucun fournisseur LLM concret n'est encore branché). Inspiré de Claude Code
-sans en être un clone.
+(`OllamaLLM` est le premier fournisseur concret branché derrière l'abstraction
+`llm.py`, d'autres restent envisageables sans changement d'architecture).
+Inspiré de Claude Code sans en être un clone.
 
 ## Philosophie
 
@@ -24,7 +25,7 @@ systématiquement sa réponse avant d'agir. Voir
 
 - **Runtime** — seul composant impur (orchestrateur) : appelle `ContextBuilder`,
   `Reasoner`, `PolicyEngine`, `Executor`, écrit dans l'`EventLog` et,
-  optionnellement, persiste vers `Storage`.
+  optionnellement, persiste vers `Storage` (événements et checkpoints).
 - **State Machine** — fonction pure `(état, événement) -> état`.
 - **Policy Engine** — fonction pure `Action -> Verdict`, détection minimale de
   commandes dangereuses, déclenchement de confirmation.
@@ -55,23 +56,30 @@ python -m pytest
 ```
 src/peon/
   cli.py               # point d'entree Typer (peon --version)
+  composition.py         # build_runtime() : assemble un Runtime pret a l'emploi
+                          # a partir d'un LLM concret et d'une liste de Tool
   runtime.py            # orchestrateur : run(), resume_confirmation(),
-                         # persist_events(), load_event_log()
+                         # persist_events(), load_event_log(),
+                         # save_checkpoint(), resume_mission()
   state_machine.py       # transition pure (etat, evenement) -> etat
   context_builder.py     # Context depuis observations ou depuis un EventLog
   reasoner.py             # ABC Reasoner + LLMReasoner (Context -> Decision)
-  llm.py                  # abstraction fournisseur LLM (aucun client concret)
+  llm.py                  # abstraction fournisseur LLM (ABC)
+  providers/
+    ollama.py              # OllamaLLM : premier fournisseur concret (API chat Ollama)
   prompts.py              # Context -> messages LLM (PromptBuilder)
   policy.py               # Action (+ ToolRegistry) -> Verdict
   executor.py             # Action validee -> ToolResult
   tool_registry.py         # registre des Tools disponibles
   event_log.py             # journal append-only en memoire
   storage.py                # abstraction Storage + InMemoryStorage
+                             # (evenements + checkpoints)
   tools/
     base.py                 # contrat Tool (ABC)
     filesystem.py             # ReadFileTool (read_file), ListDirectoryTool (list_directory)
     shell.py                   # ShellTool (run_command)
   models/                       # schemas Pydantic partages entre composants
+                                 # (dont checkpoint.py : Mission + ConfirmationRequest)
 tests/                           # miroir de src/peon/ (+ tests d'integration bout-en-bout)
 ```
 
@@ -90,23 +98,38 @@ tests/                           # miroir de src/peon/ (+ tests d'integration bo
 - Persistance minimale : `Runtime.persist_events()` sauvegarde l'`EventLog`
   courant vers un `Storage` injecté ; `Runtime.load_event_log()` reconstruit
   un `EventLog` à partir d'un `Storage`.
+- Checkpoint / reprise durable (Phase 1) : `Runtime.save_checkpoint(mission)`
+  sauvegarde un `Checkpoint` (`Mission` + `ConfirmationRequest` en attente)
+  vers `Storage` ; un **nouveau** `Runtime`, après arrêt/crash du process,
+  peut recharger ce `Checkpoint` et appeler `resume_mission()` pour restaurer
+  l'état nécessaire à `resume_confirmation()` — cas cible : une mission
+  suspendue en `AWAITING_CONFIRMATION` reprend normalement après redémarrage.
+- `OllamaLLM` (`providers/ollama.py`) : premier fournisseur `LLM` concret,
+  appelle l'API chat d'Ollama en HTTP ; assemblé avec le reste du pipeline via
+  `composition.py` (`build_runtime()`).
 - Trois Tools concrets : `read_file`, `list_directory` (lecture seule, `LOW`),
   `run_command` (exécution shell arbitraire, `MEDIUM` — la sécurité reste
   entièrement au Policy Engine, jamais filtrée par le Tool lui-même).
-- 263 tests passants (unitaires + intégration bout en bout).
+- 289 tests passants (unitaires + intégration bout en bout).
 
 ## Limitations actuelles
 
-- **Aucun fournisseur LLM concret** branché derrière l'abstraction `llm.py`
-  (`LLMReasoner`/`PromptBuilder` sont prêts, mais un Reasoner déterministe
-  scripté est utilisé partout dans les tests).
+- **Un seul fournisseur LLM concret** (`OllamaLLM`) derrière l'abstraction
+  `llm.py` ; d'autres (OpenAI, Anthropic, Gemini...) restent à écrire derrière
+  la même interface. Un Reasoner déterministe scripté reste utilisé dans la
+  majorité des tests.
 - **`Storage` n'a qu'une implémentation en mémoire** (`InMemoryStorage`) : une
-  mission ne survit pas encore réellement à un arrêt du process. Un backend
-  disque (SQLite ou autre) reste une extension future derrière la même
-  abstraction.
-- **Pas de reprise complète de mission** : recharger un `EventLog` reconstruit
-  l'historique des événements, mais ne restaure ni la `Mission` ni la
-  `StateMachine` ni une `ConfirmationRequest` en attente.
+  mission ne survit pas encore à un arrêt du process **tant qu'aucun backend
+  disque n'est branché** — l'abstraction et le mécanisme de reprise sont en
+  place (voir ci-dessus), mais `InMemoryStorage` ne persiste que pour la durée
+  du process. Un backend disque (SQLite ou autre) reste une extension future
+  derrière la même abstraction `Storage`.
+- **Reprise de mission encore partielle** : le `Checkpoint` restaure la
+  `Mission` et une éventuelle `ConfirmationRequest` en attente (le cas
+  `AWAITING_CONFIRMATION`), mais pas l'historique complet de l'`EventLog` ni
+  les `Observation` passées — un nouveau `Runtime` reprend avec un `EventLog`
+  vierge, pas un replay complet. Pas de multi-mission : un `Runtime` ne
+  retient qu'un `Checkpoint`/une confirmation en attente à la fois.
 - **CLI minimale** : seulement `peon --version` ; aucune commande d'exécution
   de mission.
 - **Détection de commandes dangereuses volontairement minimale** dans le

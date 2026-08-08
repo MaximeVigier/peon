@@ -74,10 +74,11 @@ plusieurs composants d'un coup ni anticiper une phase non demandée.
 | Composant | Rôle | Statut |
 |---|---|---|
 | **Mission** | Objectif utilisateur, statut de cycle de vie, compteur d'itérations, limite max. Donnée pure. | ✅ implémenté (`models/mission.py`) |
+| **Checkpoint** | Instantané composable d'une `Mission` et d'une éventuelle `ConfirmationRequest` en attente, suffisant pour reconstruire l'état nécessaire à `resume_confirmation()` après arrêt/crash du process. Ne porte ni l'`EventLog` ni les `Observation`. | ✅ implémenté (`models/checkpoint.py`, Phase 1 — checkpoint/reprise) |
 | **Context** | Donnée immuable remise au Reasoner : objectif, statut, itération, observations, outils disponibles. | ✅ implémenté (`models/context.py`) |
 | **Context Builder** | Seul point de passage entre Event Log, Tool Registry et Reasoner : sélectionne les événements pertinents, décrit les outils disponibles. Ne raisonne jamais, n'assemble aucun prompt (voir PromptBuilder). Deux points d'entrée : `build(observations=...)` et `build_from_event_log(event_log=...)` (reconstruit les `Observation` depuis les événements `OBSERVATION_PRODUCED`, utilisé par le Runtime). | ✅ implémenté (`context_builder.py`) |
 | **Reasoner** (ex-Planner) | Reçoit un `Context`, appelle le LLM, retourne une `Decision`. Ne construit jamais son propre contexte, ne devine jamais les outils disponibles. | ✅ implémenté : ABC (`reasoner.py`) + implémentation concrète `LLMReasoner` |
-| **LLM** | Abstraction pure d'un fournisseur de modèle : `generate(messages) -> str`. | ✅ contrat implémenté (`llm.py`) — **aucun client concret branché** (Ollama/OpenAI/...) |
+| **LLM** | Abstraction pure d'un fournisseur de modèle : `generate(messages) -> str`. | ✅ contrat implémenté (`llm.py`) — **`OllamaLLM` branché** (`providers/ollama.py`, premier fournisseur concret) ; OpenAI/Anthropic/... restent à écrire derrière la même abstraction |
 | **PromptBuilder** | Transforme un `Context` en messages LLM (`Context -> list[dict[str, str]]`), déterministe, sans logique métier. | ✅ implémenté (`prompts.py`) |
 | **State Machine** | Autorité unique de transition, fonction pure `(état, événement) -> état`. Ne consulte jamais elle-même le Policy Engine — le Verdict lui est fourni comme donnée de l'événement. | ✅ implémenté (`state_machine.py`) |
 | **Policy Engine** | Fonction pure `(Action) -> Verdict`. Consulte le Tool Registry (métadonnées uniquement). Détecte les commandes dangereuses, déclenche la confirmation. | ✅ implémenté (`policy.py`) |
@@ -86,8 +87,8 @@ plusieurs composants d'un coup ni anticiper une phase non demandée.
 | **Tool** | Contrat d'une capacité atomique : `spec` (ToolSpec) + `execute(arguments) -> ToolResult`. | ✅ contrat implémenté (`tools/base.py`) — implémentations concrètes : `ReadFileTool` (`read_file`, `LOW`), `ListDirectoryTool` (`list_directory`, `LOW`), dans `tools/filesystem.py` ; `ShellTool` (`run_command`, `MEDIUM`), dans `tools/shell.py` ; **restent à faire** `git.py`/`search.py` |
 | **Observation** | Modèle plat (`kind` + `summary` + `details`), sans dépendance vers ToolResult/ExecutionError/Verdict ni aucun composant — la traduction elle-même reste une responsabilité du Runtime. Le Reasoner ne voit jamais un ToolResult brut. | ✅ implémenté (`models/observation.py`), produite en conditions réelles par le `Runtime` |
 | **Event Log** | Journal append-only en mémoire pendant l'exécution (`append`, `list_events`, `list_events_by_type`), zéro dépendance vers Storage. | ✅ implémenté (`event_log.py`) |
-| **Storage** | Abstraction `save_events`/`load_events` (ABC), zéro dépendance vers Event Log ni logique métier. | ✅ abstraction + `InMemoryStorage` implémentées (`storage.py`) — **aucun backend disque** (SQLite ou autre) pour l'instant |
-| **Runtime** | Seul composant impur : orchestre tous les appels (Context Builder, Reasoner, Policy Engine, Executor), écrit dans l'Event Log, consomme un `ConfirmationResponse` (`resume_confirmation`). | ✅ implémenté (`runtime.py`) — persistance vers `Storage` optionnelle et explicite (`persist_events()`/`load_event_log()`), jamais automatique |
+| **Storage** | Abstraction `save_events`/`load_events` + `save_checkpoint`/`load_checkpoint` (ABC), zéro dépendance vers Event Log ni logique métier au-delà de `Event`/`Checkpoint`. | ✅ abstraction + `InMemoryStorage` implémentées (`storage.py`) — **aucun backend disque** (SQLite ou autre) pour l'instant, y compris pour les checkpoints |
+| **Runtime** | Seul composant impur : orchestre tous les appels (Context Builder, Reasoner, Policy Engine, Executor), écrit dans l'Event Log, consomme un `ConfirmationResponse` (`resume_confirmation`). | ✅ implémenté (`runtime.py`) — persistance vers `Storage` optionnelle et explicite (`persist_events()`/`load_event_log()`, `save_checkpoint()`/`resume_mission()`), jamais automatique |
 | **Critic** *(extension, hors MVP)* | Système de hooks (`BeforeToolExecution`, `AfterToolExecution`, `BeforeMissionCompletion`, `BeforeCommit`), non bloquant par défaut, jamais une dépendance obligatoire. | ❌ non implémenté, non prévu au MVP |
 | **Budget Manager** *(extension, hors MVP)* | Centraliserait itérations/tokens/temps/coût, consulté par State Machine et Context Builder. | ❌ non implémenté, non prévu au MVP |
 
@@ -103,7 +104,11 @@ le Runtime (`_request_confirmation`) et `ConfirmationResponse` est désormais
 consommée par `Runtime.resume_confirmation(mission, response)`, qui reprend le
 cycle en attente (exécution si acceptée, retour au raisonnement si refusée) —
 cf. section 4 pour la décision et section 5 pour les limites encore ouvertes
-de ce mécanisme.
+de ce mécanisme. `Checkpoint` (`models/checkpoint.py`) compose une `Mission`
+et une éventuelle `ConfirmationRequest` en attente ; produit par
+`Runtime.save_checkpoint(mission)`, consommé par `Runtime.resume_mission(checkpoint)`
+sur un nouveau `Runtime` pour restaurer l'état nécessaire à
+`resume_confirmation()` après un arrêt/crash du process.
 
 ## 4. Décisions déjà prises
 
@@ -253,6 +258,29 @@ texte d'`ARCHITECTURE.md`, valables telles quelles) :**
   `load_event_log()`), qui dépend déjà légitimement de tout. `persist_events()`
   fait un instantané complet à la demande, sans suivi incrémental : l'appeler
   deux fois duplique (cf. section 5).
+- **Checkpoint / reprise durable** (Phase 1, `models/checkpoint.py`,
+  `storage.py`, `runtime.py`) : `Checkpoint` compose une `Mission` et une
+  éventuelle `ConfirmationRequest` (`pending_confirmation: ConfirmationRequest
+  | None`) plutôt que de dupliquer leurs champs — cohérent avec la même
+  décision déjà prise pour `ConfirmationRequest`/`ConfirmationResponse`
+  (découplage par référence, jamais par recopie de champs). Ne porte
+  délibérément pas l'`EventLog` ni les `Observation` : le périmètre de cette
+  phase est de restaurer juste assez d'état pour que `resume_confirmation()`
+  fonctionne sur un nouveau `Runtime`, pas de rejouer l'historique complet
+  (event-sourcing/replay reste hors périmètre, cf. `ARCHITECTURE.md`). `Storage`
+  étendu de façon additive (`save_checkpoint`/`load_checkpoint`), signatures et
+  sémantique de `save_events`/`load_events` inchangées. `InMemoryStorage` ne
+  retient qu'un seul `Checkpoint` à la fois (remplacé, pas accumulé — cohérent
+  avec le périmètre mono-Mission de cette phase) et retourne des copies
+  profondes à la sauvegarde comme au chargement (une `Mission` restant mutable,
+  contrairement à `Event`). Côté `Runtime` : `save_checkpoint(mission)` prend
+  la `Mission` en paramètre explicite plutôt que de la garder comme attribut
+  d'instance — même choix que `resume_confirmation(mission, response)`, pour
+  ne pas introduire un `self._mission` que rien d'autre dans `Runtime`
+  n'a besoin de porter. `resume_mission(checkpoint)` ne fait que restaurer
+  `self._pending_confirmation` et retourner la `Mission` : aucune duplication
+  de la boucle ReAct, aucune I/O, réutilise entièrement `resume_confirmation()`
+  déjà existant pour la suite du cycle.
 
 ## 5. Points volontairement laissés ouverts
 
@@ -340,35 +368,52 @@ texte d'`ARCHITECTURE.md`, valables telles quelles) :**
     chaque appel, sans suivi de ce qui a déjà été persisté : l'appeler deux
     fois duplique dans `Storage`. Pas de branchement automatique dans la
     boucle de raisonnement (delibérément hors périmètre de la phase Storage).
-25. Recharger un `EventLog` depuis `Storage` (`Runtime.load_event_log`) ne
+25. ~~Recharger un `EventLog` depuis `Storage` (`Runtime.load_event_log`) ne
     restaure ni la `Mission` (statut, compteur d'itérations) ni la
     `StateMachine` ni une `ConfirmationRequest` en attente — seul l'historique
     brut des événements est reconstructible. Une vraie « reprise de mission
-    après arrêt du process » reste à concevoir.
-26. `Storage` n'a qu'une implémentation en mémoire (`InMemoryStorage`) : malgré
-    l'abstraction en place, une Mission ne survit pas encore réellement à un
-    arrêt du process. Un backend disque (SQLite ou autre) reste à écrire
-    derrière la même interface `Storage`.
+    après arrêt du process » reste à concevoir.~~ — résolu partiellement par
+    l'implémentation (Phase 1, checkpoint/reprise) : `Checkpoint`
+    (`models/checkpoint.py`) + `Runtime.save_checkpoint()`/`resume_mission()`
+    restaurent la `Mission` et une `ConfirmationRequest` en attente sur un
+    nouveau `Runtime`, suffisant pour que `resume_confirmation()` fonctionne
+    après un arrêt/crash du process — voir section 4. Reste ouvert : l'`EventLog`
+    lui-même n'est pas rejoué dans ce mécanisme (un nouveau `Runtime` repart
+    avec un `EventLog` vierge sauf appel séparé à `load_event_log()`) ; un vrai
+    replay complet (Observations/historique de raisonnement restaurés) reste
+    hors périmètre, cf. `ARCHITECTURE.md`.
+26. `Storage` n'a qu'une implémentation en mémoire (`InMemoryStorage`), pour les
+    événements comme pour les checkpoints : malgré l'abstraction et le
+    mécanisme de reprise en place (point 25), une Mission ne survit pas encore
+    à un arrêt réel du process (fin du process = perte de `InMemoryStorage`).
+    Un backend disque (SQLite ou autre) reste à écrire derrière la même
+    interface `Storage`.
 27. `Runtime` ne retient qu'une seule `ConfirmationRequest` en attente à la
     fois (`self._pending_confirmation`, réinitialisée à chaque `run()`) :
     suffisant pour une Mission à la fois, pas conçu pour plusieurs Missions
-    concurrentes sur un même `Runtime`.
+    concurrentes sur un même `Runtime`. `Checkpoint` hérite de la même
+    limite : `Storage.save_checkpoint()`/`load_checkpoint()` ne retiennent
+    qu'un seul `Checkpoint` à la fois, pas une reprise multi-mission
+    (délibérément hors périmètre de la Phase 1 — voir `ARCHITECTURE.md`).
 
 ## 6. État actuel d'implémentation
 
-**Implémenté et testé (263 tests, tous verts) :**
+**Implémenté et testé (289 tests, tous verts) :**
 
 ```
 src/peon/
   __init__.py, cli.py                    # scaffold Phase 0 (peon --version)
+  composition.py                         # build_runtime() : assemble un Runtime depuis un LLM concret
   models/
-    mission.py, context.py, decision.py, action.py,
+    mission.py, checkpoint.py, context.py, decision.py, action.py,
     tool_spec.py, tool_result.py, execution_error.py, verdict.py,
     confirmation.py, events.py, observation.py
   tools/
     base.py                              # contrat Tool (ABC)
     filesystem.py                        # ReadFileTool (read_file), ListDirectoryTool (list_directory)
     shell.py                             # ShellTool (run_command, RiskLevel.MEDIUM)
+  providers/
+    ollama.py                            # OllamaLLM : premier fournisseur LLM concret
   tool_registry.py                       # enregistre des Tool, pas seulement des ToolSpec
   executor.py
   policy.py
@@ -376,11 +421,13 @@ src/peon/
   event_log.py                           # journal append-only en memoire (Event/EventType)
   context_builder.py                     # build() et build_from_event_log() -> Context
   reasoner.py                            # ABC Reasoner + LLMReasoner (implementation concrete)
-  llm.py                                 # ABC LLM, aucun client concret
+  llm.py                                 # ABC LLM
   prompts.py                             # PromptBuilder : Context -> messages LLM
-  storage.py                             # ABC Storage + InMemoryStorage (save_events/load_events)
+  storage.py                             # ABC Storage + InMemoryStorage
+                                          # (save_events/load_events, save_checkpoint/load_checkpoint)
   runtime.py                             # orchestrateur : assemble tous les composants ci-dessus,
-                                          # + resume_confirmation, persist_events, load_event_log
+                                          # + resume_confirmation, persist_events, load_event_log,
+                                          # save_checkpoint, resume_mission
 ```
 
 Le cycle complet `Mission -> Context -> Reasoner -> Decision -> Policy Engine
@@ -389,17 +436,25 @@ bout en bout par des tests d'intégration sans mock interne
 (`tests/test_integration_read_file.py`,
 `tests/test_integration_list_directory.py`,
 `tests/test_integration_run_command.py`), avec de vrais `Tool` (I/O disque et
-sous-processus réels) et un Reasoner stub déterministe (pas de LLM branché).
+sous-processus réels) et un Reasoner stub déterministe pour la plupart des
+tests (un vrai `OllamaLLM` est exercé via `tests/providers/test_ollama.py` et
+`tests/test_integration_llm_provider.py`, contre un faux serveur HTTP local).
 La boucle de confirmation humaine complète (`tests/test_confirmation_flow.py`)
 et le round-trip `EventLog -> Storage -> reload -> ContextBuilder`
 (`tests/test_runtime_storage.py`) sont également exercés de bout en bout.
+Le checkpoint/reprise après crash simulé (deux instances `Runtime` distinctes,
+confirmation restaurée puis acceptée/refusée) est couvert par
+`tests/test_checkpoint.py` (Phase 1).
 
 **Non implémenté :** un backend `Storage` persistant sur disque (SQLite ou
-autre) derrière l'abstraction déjà en place, `tools/git.py`, `tools/search.py`,
-tout fournisseur `LLM` concret (Ollama/OpenAI/...) derrière l'abstraction
-`llm.py`, et toute CLI interactive capable de produire un `ConfirmationResponse`
-réel (le mécanisme de reprise lui-même, `Runtime.resume_confirmation`, est
-implémenté et testé — voir section 4).
+autre) derrière l'abstraction déjà en place (y compris pour les checkpoints),
+`tools/git.py`, `tools/search.py`, un second fournisseur `LLM` concret
+au-delà d'`OllamaLLM` (OpenAI/Anthropic/...), toute CLI interactive capable de
+produire un `ConfirmationResponse` réel (le mécanisme de reprise lui-même,
+`Runtime.resume_confirmation`, est implémenté et testé — voir section 4), et
+la restauration complète de l'`EventLog`/des `Observation` lors d'une reprise
+(le `Checkpoint` restaure la `Mission` et la confirmation en attente, pas
+l'historique de raisonnement — voir point 25, section 5).
 
 **Git** : dépôt local initialisé, dossier de travail local renommé
 `projects/arne/` -> `projects/peon/` pour correspondre au nom du futur dépôt
@@ -416,20 +471,29 @@ une abstraction + `InMemoryStorage` existent, "futur Runtime" alors que
 montrant une persistance automatique par événement qui n'a jamais été
 implémentée ainsi).
 
+Mise à jour ultérieure (Phase 1 — checkpoint/reprise) : correction du
+compteur de tests (263 -> 279 au moment de cette phase, puis 289 avec les
+tests de checkpoint ajoutés), documentation d'`OllamaLLM`/`composition.py`
+(déjà présents dans le code mais jamais reflétés ici), et documentation du
+nouveau `Checkpoint`/mécanisme de reprise.
+
 ## 7. État actuel — travail restant identifié
 
 Pas de phase suivante choisie ici — cette section décrit uniquement ce qui
 reste absent aujourd'hui, sans engager de priorité :
 
 - Backend `Storage` persistant sur disque (SQLite ou autre) derrière
-  l'abstraction déjà en place ; suivi incrémental de `persist_events()` pour
-  éviter la duplication en cas d'appels multiples.
-- Reprise complète d'une Mission après arrêt du process (restauration de la
-  `Mission`/`StateMachine`/`ConfirmationRequest` en attente depuis un
-  `EventLog` rechargé, pas seulement l'historique brut des événements).
+  l'abstraction déjà en place, pour les événements comme pour les checkpoints ;
+  suivi incrémental de `persist_events()` pour éviter la duplication en cas
+  d'appels multiples.
+- Reprise de Mission après arrêt du process : le cas ciblé par la Phase 1
+  (`Checkpoint` + `Runtime.save_checkpoint()`/`resume_mission()`) est
+  implémenté et testé — restauration de la `Mission` et d'une
+  `ConfirmationRequest` en attente sur un nouveau `Runtime`. Reste absent :
+  restauration de l'`EventLog`/des `Observation` (replay complet de
+  l'historique de raisonnement, pas seulement de l'état mission/confirmation),
+  reprise multi-mission, backend disque réel (voir point ci-dessus).
 - Tools concrets restants : `git.py`, `search.py`.
-- Un fournisseur `LLM` concret (Ollama, a minima, cohérent avec la stack
-  documentée en section 1) derrière l'abstraction `llm.py`.
 - Connexion de `LLMReasoner`/`InvalidLLMResponseError` au Runtime.
 - CLI interactive capable de produire un vrai `ConfirmationResponse`
   utilisateur (le mécanisme de reprise côté Runtime, lui, est déjà implémenté

@@ -4,6 +4,7 @@ from peon.context_builder import ContextBuilder
 from peon.event_log import EventLog
 from peon.executor import Executor
 from peon.models.action import Action
+from peon.models.checkpoint import Checkpoint
 from peon.models.confirmation import ConfirmationRequest, ConfirmationResponse
 from peon.models.context import Context
 from peon.models.decision import ActionDecision, FinishDecision
@@ -83,6 +84,28 @@ class Runtime:
         for event in storage.load_events():
             event_log.append(event)
         return event_log
+
+    def save_checkpoint(self, mission: Mission) -> Checkpoint:
+        # Instantane explicite, a la demande (meme philosophie que
+        # persist_events()) : jamais declenche automatiquement par le cycle de
+        # raisonnement. Le point pertinent pour cette phase est apres que
+        # run()/resume_confirmation() ait rendu la main en AWAITING_CONFIRMATION,
+        # mais rien n'empeche d'appeler cette methode a un autre moment.
+        if self._storage is None:
+            raise StorageNotConfiguredError("no Storage was injected into this Runtime")
+        checkpoint = Checkpoint(mission=mission, pending_confirmation=self._pending_confirmation)
+        self._storage.save_checkpoint(checkpoint)
+        return checkpoint
+
+    def resume_mission(self, checkpoint: Checkpoint) -> Mission:
+        # Restaure uniquement ce qu'un nouveau Runtime a besoin de savoir pour
+        # que resume_confirmation() fonctionne : la Mission et la confirmation
+        # en attente. Ne rejoue aucun evenement (EventLog reste vierge tant que
+        # load_event_log() n'est pas appele separement) et ne duplique aucune
+        # logique de la boucle ReAct existante.
+        self._pending_confirmation = checkpoint.pending_confirmation
+        self._observations = []
+        return checkpoint.mission
 
     def run(self, goal: str, *, max_iterations: int | None = None) -> Mission:
         mission = Mission(goal=goal) if max_iterations is None else Mission(goal=goal, max_iterations=max_iterations)

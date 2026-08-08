@@ -33,11 +33,37 @@ une `Observation` si refusée). `Storage` reste un collaborateur injecté,
 jamais un singleton global : le Runtime fonctionne sans lui, la persistance
 étant simplement indisponible dans ce cas.
 
+Expose également `save_checkpoint(mission)` (instantané explicite d'un
+**Checkpoint** vers `Storage`, à la demande — même philosophie que
+`persist_events()`, jamais automatique) et `resume_mission(checkpoint)` : un
+**nouveau** Runtime (nouvel `EventLog`, potentiellement vierge) restaure ainsi
+la `Mission` et l'éventuelle `ConfirmationRequest` en attente d'un
+`Checkpoint` chargé, sans rejouer l'historique — juste assez d'état pour que
+`resume_confirmation()` fonctionne normalement ensuite. Aucune duplication de
+la boucle de raisonnement : ce mécanisme réutilise `resume_confirmation()` et
+les transitions déjà existantes.
+
 ### Mission
 Unité de travail de haut niveau : objectif utilisateur, statut de cycle de vie
 (`en cours` / `succès` / `échec` / `max itérations`), compteur d'itérations et
 limite max. Donnée pure — pas de comportement propre. Sa progression est décidée
 et écrite exclusivement par la State Machine.
+
+### Checkpoint
+Implémenté (`models/checkpoint.py`). Instantané composable — compose une
+`Mission` et une éventuelle `ConfirmationRequest` en attente plutôt que de
+dupliquer leurs champs — suffisant pour reconstruire l'état nécessaire à une
+reprise après arrêt/crash du process, dans le cas ciblé par cette phase :
+`action -> REQUIRES_CONFIRMATION`. Ne porte ni l'`EventLog` ni les
+`Observation` (pas de persistance automatique des événements dans le
+checkpoint, pas d'event-sourcing/replay complet dans cette phase — hors
+périmètre, voir **Hors périmètre du MVP**). Modèle Pydantic sérialisable
+(`model_dump_json()`/`model_validate_json()`), `frozen=True` au niveau du
+`Checkpoint` lui-même (il représente un instantané déjà pris, jamais
+recalculé après coup — même rationale que `Event`), même si la `Mission`
+qu'il embarque reste mutable. Produit et consommé exclusivement par le
+**Runtime** (`save_checkpoint()` / `resume_mission()`), persisté via
+**Storage** (`save_checkpoint()` / `load_checkpoint()`).
 
 ### Context Builder
 Seul point de passage entre l'**Event Log**, le **Tool Registry** et le
@@ -185,14 +211,24 @@ de ces événements, un payload invalide signale un bug, pas une entrée externe
 à tolérer.
 
 ### Storage
-Abstraction de persistance des événements (`storage.py`), volontairement
-minimale : `Storage` (ABC) déclare `save_events(events: list[Event]) -> None`
-et `load_events() -> list[Event]`, rien d'autre — pas de logique métier, ne
-connaît ni Runtime, ni Reasoner, ni Policy Engine, ni Executor, ni Tool, ni
-Mission, seulement `Event`. Une seule implémentation concrète existe à ce
-jour, `InMemoryStorage` : append-only (pas de suppression, pas de
+Abstraction de persistance (`storage.py`), volontairement minimale : `Storage`
+(ABC) déclare `save_events(events: list[Event]) -> None` et
+`load_events() -> list[Event]` — pas de logique métier, ne connaît ni Runtime,
+ni Reasoner, ni Policy Engine, ni Executor, ni Tool. Étendue de façon additive
+avec `save_checkpoint(checkpoint: Checkpoint) -> None` et
+`load_checkpoint() -> Checkpoint | None` (Phase 1 — checkpoint/reprise) : les
+signatures et la sémantique de `save_events`/`load_events` restent
+inchangées. `Storage` connaît désormais aussi `Checkpoint` (donc, par
+composition, `Mission` et `ConfirmationRequest`), mais toujours aucune
+dépendance vers Runtime, Reasoner, Policy Engine ou Executor. Une seule
+implémentation concrète existe à ce jour, `InMemoryStorage` :
+`save_events`/`load_events` restent append-only (pas de suppression, pas de
 modification d'un événement existant), `load_events()` retourne toujours une
-copie, jamais la référence interne.
+copie, jamais la référence interne. `save_checkpoint`/`load_checkpoint` ne
+retiennent qu'un seul `Checkpoint` à la fois (remplacé à chaque appel, pas
+accumulé comme les événements — cohérent avec le périmètre mono-Mission de
+cette phase), et retournent également des copies profondes (une `Mission`
+étant mutable, contrairement à `Event`).
 
 **État réel (pas SQLite actuellement)** : aucune persistance disque n'existe
 encore — une Mission ne survit donc pas vraiment à un arrêt du process malgré
@@ -500,11 +536,16 @@ actuelle). Non implémentés.
 ## Hors périmètre du MVP
 
 Event-sourcing complet (état dérivé des événements), reprise après crash par
-replay (Storage le permettra un jour, non branché maintenant), plan amont
-multi-étapes, Critic (hooks posés, aucun Critic écrit), Budget Manager,
-verdict `REWRITE` du Policy Engine, mémoire sémantique, multi-agents, Policy
-Engine au-delà de permissions/commandes dangereuses/confirmation (pas de
-sandbox ni de quotas pour l'instant).
+**replay complet de l'Event Log** (non branché — la Phase 1 checkpoint/reprise
+restaure la `Mission` et une `ConfirmationRequest` en attente via `Checkpoint`,
+pas l'historique complet des événements/observations ; voir **Checkpoint**
+ci-dessus), backend `Storage` sur disque (SQLite ou autre — seule
+`InMemoryStorage` existe, y compris pour les checkpoints), reprise
+multi-mission (un `Runtime` ne retient qu'un `Checkpoint`/une confirmation en
+attente à la fois), plan amont multi-étapes, Critic (hooks posés, aucun Critic
+écrit), Budget Manager, verdict `REWRITE` du Policy Engine, mémoire
+sémantique, multi-agents, Policy Engine au-delà de permissions/commandes
+dangereuses/confirmation (pas de sandbox ni de quotas pour l'instant).
 
 ## Structure du projet
 
@@ -520,9 +561,12 @@ peon/
 ├── src/peon/
 │   ├── __init__.py
 │   ├── cli.py              # point d'entree Typer (peon --version)
+│   ├── composition.py      # build_runtime() : assemble un Runtime a partir d'un LLM concret
+│   │                        # et d'une liste de Tool, sans coupler Runtime a un fournisseur
 │   ├── runtime.py          # orchestrateur impur : appelle context_builder/reasoner/executor,
 │   │                        # alimente state_machine et event_log, persiste optionnellement
-│   │                        # vers storage (persist_events / load_event_log)
+│   │                        # vers storage (persist_events / load_event_log,
+│   │                        # save_checkpoint / resume_mission)
 │   ├── state_machine.py    # transition pure (etat, evenement) -> etat ; ne consulte pas
 │   │                        # policy.py (Verdict fourni par l'appelant, Runtime)
 │   ├── context_builder.py  # Observations ou Event Log -> Context (build / build_from_event_log)
@@ -531,9 +575,14 @@ peon/
 │   ├── executor.py         # Action validee -> ToolResult (resout le Tool via tool_registry.py)
 │   ├── tool_registry.py    # registre des Tools : descriptions, schemas, risk level, cost estimate
 │   ├── event_log.py        # journal append-only en memoire, zero dependance vers storage.py
-│   ├── storage.py          # abstraction Storage (ABC) + InMemoryStorage, pas de backend disque
-│   ├── llm.py              # abstraction fournisseur LLM (aucun client concret branche)
+│   ├── storage.py          # abstraction Storage (ABC) + InMemoryStorage (evenements et
+│   │                        # checkpoints), pas de backend disque
+│   ├── llm.py              # abstraction fournisseur LLM (ABC)
 │   ├── prompts.py          # PromptBuilder : Context -> messages LLM
+│   │
+│   ├── providers/
+│   │   ├── __init__.py
+│   │   └── ollama.py       # OllamaLLM : premier fournisseur LLM concret (API chat Ollama, HTTP)
 │   │
 │   ├── tools/
 │   │   ├── __init__.py
@@ -544,6 +593,7 @@ peon/
 │   └── models/              # schemas Pydantic partages entre composants
 │       ├── __init__.py
 │       ├── mission.py
+│       ├── checkpoint.py    # Checkpoint : Mission + ConfirmationRequest|None (Phase 1)
 │       ├── context.py
 │       ├── decision.py
 │       ├── action.py
@@ -555,7 +605,8 @@ peon/
 │       ├── tool_spec.py     # declaration d'un Tool : name/description/parameters/risk/cost
 │       └── events.py
 │
-└── tests/                   # miroir de src/peon/ (+ tests/tools/, tests/models/, integration)
+└── tests/                   # miroir de src/peon/ (+ tests/tools/, tests/models/,
+                              # tests/providers/, integration, test_checkpoint.py)
 ```
 
 `tools/git.py` et `tools/search.py`, envisagés dans une version antérieure de
