@@ -81,7 +81,7 @@ plusieurs composants d'un coup ni anticiper une phase non demandée.
 | **LLM** | Abstraction pure d'un fournisseur de modèle : `generate(messages) -> str`. | ✅ contrat implémenté (`llm.py`) — **`OllamaLLM` branché** (`providers/ollama.py`, premier fournisseur concret) ; OpenAI/Anthropic/... restent à écrire derrière la même abstraction |
 | **PromptBuilder** | Transforme un `Context` en messages LLM (`Context -> list[dict[str, str]]`), déterministe, sans logique métier. | ✅ implémenté (`prompts.py`) |
 | **State Machine** | Autorité unique de transition, fonction pure `(état, événement) -> état`. Ne consulte jamais elle-même le Policy Engine — le Verdict lui est fourni comme donnée de l'événement. | ✅ implémenté (`state_machine.py`) |
-| **Policy Engine** | Fonction pure `(Action) -> Verdict`. Consulte le Tool Registry (métadonnées uniquement). Détecte les commandes dangereuses, déclenche la confirmation. | ✅ implémenté (`policy.py`) |
+| **Policy Engine** | Fonction pure `(Action) -> Verdict`. Consulte le Tool Registry (métadonnées uniquement). Depuis la Phase 3, compose une chaîne ordonnée de `PolicyRule` (`guardrails.py`) : autorisation par Tool, détection de commandes dangereuses, validation d'arguments contre `ToolSpec.parameters_schema`, restriction de chemin optionnelle, `risk_level` générique en dernier recours. | ✅ implémenté (`policy.py` + `guardrails.py`, Phase 3) |
 | **Executor** | Exécute une Action déjà validée via le Tool résolu par le Tool Registry ; convertit les échecs en `ExecutionError`. Ne parle jamais au LLM ni au Policy Engine. | ✅ implémenté (`executor.py`) |
 | **Tool Registry** | Source de vérité unique sur les outils disponibles (instances `Tool` exécutables, pas seulement leur description). | ✅ implémenté (`tool_registry.py`) |
 | **Tool** | Contrat d'une capacité atomique : `spec` (ToolSpec) + `execute(arguments) -> ToolResult`. | ✅ contrat implémenté (`tools/base.py`) — implémentations concrètes : `ReadFileTool` (`read_file`, `LOW`), `ListDirectoryTool` (`list_directory`, `LOW`), dans `tools/filesystem.py` ; `ShellTool` (`run_command`, `MEDIUM`), dans `tools/shell.py` ; toutes trois injectées avec un `Workspace` depuis la Phase 2 (délèguent l'I/O, ne touchent plus `pathlib`/`subprocess` directement) ; **restent à faire** `git.py`/`search.py` |
@@ -312,6 +312,61 @@ texte d'`ARCHITECTURE.md`, valables telles quelles) :**
   `Tool` lui-même, seulement le `ToolRegistry` à partir d'instances déjà
   construites par l'appelant. `PolicyEngine`, `Executor`, `StateMachine`,
   `EventLog`, `Storage`/`Checkpoint` : aucun n'a été touché par cette phase.
+- **Policy / Guardrails** (Phase 3, `guardrails.py`, `policy.py`) :
+  `PolicyEngine.evaluate()` ne porte plus lui-même la logique de règle — il
+  compose une chaîne ordonnée de `PolicyRule` (`Action -> Verdict | None`,
+  `Protocol` plutôt qu'une hiérarchie de classes, aucune abstraction
+  supplémentaire n'étant justifiée). Ordre par défaut, invariant de sécurité :
+  `ToolAuthorizationRule` → `DangerousCommandRule` → `ArgumentsSchemaRule` →
+  (`PathRestrictionRule`, seulement si `workspace_root` est fourni) →
+  `RiskLevelRule`. La règle spécifique (`DangerousCommandRule`) garde la
+  priorité sur la règle générique (`RiskLevelRule`), exactement comme avant
+  cette phase — invariant explicitement demandé et vérifié par
+  `test_dangerous_command_rule_takes_priority_over_the_generic_risk_level_rule`.
+  `PolicyEngine(registry)` (constructeur par défaut, seule forme utilisée par
+  tous les appelants existant avant cette phase) reproduit exactement le
+  comportement observable pré-Phase 3 : `ArgumentsSchemaRule`, bien que
+  nouvelle, ne rejette jamais une Action qui passait avant (tous les
+  `ToolSpec` réels déclarent des schémas conformes aux arguments réellement
+  envoyés dans les tests/l'usage existant), et `PathRestrictionRule` est
+  absente tant que `workspace_root` n'est pas explicitement fourni.
+  **Autorisation par Tool** (`ToolAuthorizationRule`) : reste équivalente à
+  « connu du `ToolRegistry` » — `ToolSpec` ne porte aujourd'hui aucun champ
+  d'autorisation distinct (pas de `enabled`, pas de rôles) ; en inventer un
+  aurait fait doublon avec le registre déjà injecté au `PolicyEngine`, donc
+  pas fait dans cette phase (voir section 5, nouveau point ouvert).
+  **Validation des arguments** (`ArgumentsSchemaRule`) : résout le point
+  ouvert « qui valide `Action.arguments` contre
+  `ToolSpec.parameters_schema` ? » — c'est le Policy Engine, jamais le Tool
+  ni l'Executor. Sous-ensemble minimal de JSON Schema implémenté à la main
+  (`type: object`, `properties`, `required`) plutôt qu'une dépendance externe
+  (`jsonschema`), suffisant pour tous les `ToolSpec` existants et cohérent
+  avec le peu de dépendances du projet ; `additionalProperties` non spécifié
+  reste permissif (sémantique JSON Schema standard), seul
+  `additionalProperties: false` explicite le restreindrait. Réutilise
+  `DENIED` (pas de cinquième `Verdict`) pour une Action structurellement
+  invalide.
+  **Restriction de chemin** (`PathRestrictionRule`) : la racine autorisée
+  (`workspace_root`) est une donnée de configuration passée directement au
+  `PolicyEngine` (`Path`), jamais lue depuis `Workspace` — `Workspace`
+  n'avait et n'a toujours aucune notion de racine (`LocalWorkspace()` sans
+  argument, Phase 2 inchangée), et lui en ajouter une l'aurait transformé en
+  arbitre de sécurité, contraire à son rôle de port technique pur. La règle
+  ne s'applique qu'aux Tools dont `ToolSpec.parameters_schema` déclare une
+  propriété nommée `path` (déterminé depuis le schéma, jamais depuis une
+  liste de noms de Tools codée en dur) ; résout la traversée (`..`) et les
+  chemins absolus via `Path.resolve()` + containment check
+  (`root in resolved.parents`). Opt-in : `PolicyEngine(registry)` sans
+  `workspace_root` ne restreint toujours aucun chemin — aucun appelant
+  existant (composition.py, tests) ne configure de racine aujourd'hui,
+  `cli.py` reste le point d'insertion naturel plus tard (hors périmètre de
+  cette phase, aucune CLI de mission n'existe encore).
+  **Fail-closed de composition** : si une chaîne de `PolicyRule` personnalisée
+  (paramètre `rules=`) ne produit aucun `Verdict` pour une Action donnée,
+  `evaluate()` lève `AssertionError` plutôt que d'autoriser silencieusement
+  par défaut — choix délibéré pour un moteur de sécurité, la composition par
+  défaut (toujours terminée par `RiskLevelRule`, inconditionnelle pour tout
+  Tool enregistré) n'atteint jamais ce chemin.
 
 ## 5. Points volontairement laissés ouverts
 
@@ -331,8 +386,11 @@ texte d'`ARCHITECTURE.md`, valables telles quelles) :**
 7. `ToolRegistry` n'expose pas d'accesseur métadonnées-seule distinct de
    `get(name) -> Tool` — le Policy Engine respecte "ne jamais exécuter" par
    discipline, pas par un type qui l'en empêcherait structurellement.
-8. Qui valide `Action.arguments` contre `ToolSpec.parameters_schema` ? Le Tool
-   lui-même, l'Executor en amont, les deux ? Non tranché.
+8. ~~Qui valide `Action.arguments` contre `ToolSpec.parameters_schema` ? Le
+   Tool lui-même, l'Executor en amont, les deux ?~~ — résolu par la Phase 3
+   (Policy/Guardrails) : c'est le Policy Engine (`ArgumentsSchemaRule`,
+   `guardrails.py`), jamais le Tool ni l'Executor. Sous-ensemble minimal de
+   JSON Schema (`type`, `properties`, `required`), voir section 4.
 9. Que fait le Runtime face à un `ExecutionError(SYSTEM_ERROR)` ? Échec
    automatique de la Mission, ou nouvelle tentative laissée au Reasoner ?
 10. `ExecutionError.details` reste un `dict[str, Any]` libre, non structuré
@@ -366,11 +424,19 @@ texte d'`ARCHITECTURE.md`, valables telles quelles) :**
     sans les distinguer : la suggestion `REWRITE` (l'`Action` alternative)
     devra être portée dans `details` par le Runtime. À séparer en un kind
     dédié plus tard si besoin, ou rester ainsi ?
-19. Aucune restriction de chemin dans `ReadFileTool`/`ListDirectoryTool`
-    (volontaire, hors périmètre de leur phase respective) : depuis la Phase 2,
-    le point d'insertion naturel d'une telle restriction serait `Workspace`
-    (ou un futur `PolicyEngine` consulté en amont), pas le Tool lui-même —
-    toujours non conçu, non implémenté (Phase 3, sécurité).
+19. ~~Aucune restriction de chemin dans `ReadFileTool`/`ListDirectoryTool`~~
+    — résolu partiellement par la Phase 3 : `PathRestrictionRule`
+    (`guardrails.py`), consultée par le `PolicyEngine`, pas par les Tools
+    ni par `Workspace` (confirmant l'intuition déjà notée ici que le point
+    d'insertion naturel était le Policy Engine plutôt que le Tool). Opt-in
+    via `PolicyEngine(registry, workspace_root=...)` : aucune racine n'est
+    configurée par défaut aujourd'hui (ni `composition.py`, ni une CLI de
+    mission, qui n'existe toujours pas), donc aucune restriction n'est
+    encore active en usage réel — seul le mécanisme existe et est testé.
+    Reste ouvert : qui doit fournir `workspace_root` en pratique (une future
+    CLI ? `composition.py` ?), et si la racine doit un jour être dérivée du
+    `Workspace` lui-même plutôt que configurée séparément (actuellement les
+    deux sont indépendants par choix, voir section 4).
 20. Format d'`output` des Tools filesystem non uniformisé : `ReadFileTool`
     retourne une chaîne (contenu brut), `ListDirectoryTool` une liste triée de
     noms (`list[str]`), sans distinguer fichier/dossier ni exposer de
@@ -426,10 +492,26 @@ texte d'`ARCHITECTURE.md`, valables telles quelles) :**
     limite : `Storage.save_checkpoint()`/`load_checkpoint()` ne retiennent
     qu'un seul `Checkpoint` à la fois, pas une reprise multi-mission
     (délibérément hors périmètre de la Phase 1 — voir `ARCHITECTURE.md`).
+28. `ToolAuthorizationRule` (Phase 3, `guardrails.py`) traite « autorisé »
+    comme strictement équivalent à « enregistré dans le `ToolRegistry` » :
+    `ToolSpec` ne porte aucun champ d'autorisation plus fin (pas de rôles,
+    pas de `enabled: bool` désactivable sans désenregistrer le Tool). Suffit
+    au périmètre demandé par la Phase 3 (refuser un Tool inconnu), mais une
+    autorisation par utilisateur/mode d'exécution/environnement, si elle
+    devient nécessaire, demandera un champ dédié sur `ToolSpec` (ou un
+    mécanisme séparé consulté par cette même règle) — non conçu, non
+    implémenté.
+29. `PathRestrictionRule` (Phase 3) détecte l'échappement de racine via
+    `Path.resolve()` + containment check, sans traiter explicitement les
+    liens symboliques (un lien pointant hors racine résout vers sa cible
+    réelle, ce qui reste le comportement correct pour `Path.resolve()`, mais
+    n'a pas de test dédié) ni les cas Windows spécifiques au-delà de ce que
+    `pathlib` gère nativement (lettres de lecteur, chemins UNC) — non
+    approfondi dans cette phase.
 
 ## 6. État actuel d'implémentation
 
-**Implémenté et testé (295 tests, tous verts) :**
+**Implémenté et testé (328 tests, tous verts) :**
 
 ```
 src/peon/
@@ -451,7 +533,8 @@ src/peon/
     ollama.py                            # OllamaLLM : premier fournisseur LLM concret
   tool_registry.py                       # enregistre des Tool, pas seulement des ToolSpec
   executor.py
-  policy.py
+  policy.py                              # PolicyEngine.evaluate() : compose la chaine de guardrails.py
+  guardrails.py                          # PolicyRule (Protocol) + regles composables (Phase 3)
   state_machine.py                       # fonction pure transition(), evenements dedies
   event_log.py                           # journal append-only en memoire (Event/EventType)
   context_builder.py                     # build() et build_from_event_log() -> Context
@@ -520,6 +603,18 @@ constructeur plutôt que d'appeler `pathlib`/`subprocess` directement,
 comportement fonctionnel strictement inchangé. Compteur de tests : 289 ->
 295 (6 nouveaux tests dans `tests/test_workspace.py`).
 
+Mise à jour ultérieure (Phase 3 — Policy / Guardrails) : `PolicyEngine`
+refactoré pour composer une chaîne ordonnée de `PolicyRule` (`guardrails.py`,
+nouveau module) au lieu de porter lui-même la logique de règle. Ordre
+préservé exactement (motif de commande dangereuse avant `risk_level`
+générique) ; deux règles nouvelles ajoutées (`ArgumentsSchemaRule`,
+`PathRestrictionRule`, cette dernière opt-in via `workspace_root`) ; aucune
+logique de sécurité déplacée vers un Tool, `Workspace`, l'`Executor` ou la
+`StateMachine` — voir section 4 pour le détail des décisions. Compteur de
+tests : 295 -> 328 (20 nouveaux tests dans `tests/test_guardrails.py`, 13
+nouveaux dans `tests/test_policy.py`), zéro régression sur les 295 tests
+préexistants (aucun modifié).
+
 ## 7. État actuel — travail restant identifié
 
 Pas de phase suivante choisie ici — cette section décrit uniquement ce qui
@@ -542,12 +637,17 @@ reste absent aujourd'hui, sans engager de priorité :
   utilisateur (le mécanisme de reprise côté Runtime, lui, est déjà implémenté
   et testé).
 - CLI au-delà de `peon --version`.
-- Sécurité au niveau `Workspace` (Phase 3, non commencée) : le port
-  `Workspace`/`LocalWorkspace` introduit en Phase 2 est une indirection
-  technique pure — pas de restriction de chemins, pas de sandbox, pas
-  d'allowlist de commandes, pas de timeout shell. Toute évolution en ce sens
-  (ex. `DockerWorkspace`/`RemoteWorkspace`, validation d'arguments
-  supplémentaire) reste à concevoir.
+- Sécurité au-delà de ce que couvre la Phase 3 (Policy/Guardrails, terminée -
+  voir section 4 et 6) : `Workspace`/`LocalWorkspace` reste une indirection
+  technique pure sans sandbox ni allowlist de commandes ni timeout shell (ces
+  sujets restent hors périmètre, volontairement, cf. `ARCHITECTURE.md`) ;
+  `PathRestrictionRule` existe mais n'est configurée par aucun appelant réel
+  aujourd'hui (`workspace_root` jamais fourni par `composition.py` ni une
+  CLI, qui n'existe pas encore) ; `ToolAuthorizationRule` ne distingue pas
+  « autorisé » de « enregistré » (pas de rôles/permissions par utilisateur ou
+  mode d'exécution, voir section 5, point 28). Toute évolution en ce sens
+  (ex. `DockerWorkspace`/`RemoteWorkspace`, autorisation plus fine que
+  l'appartenance au `ToolRegistry`) reste à concevoir.
 
 Une nouvelle session doit **demander à l'utilisateur** quelle est la
 prochaine étape plutôt que d'en choisir une — conformément à la méthode de

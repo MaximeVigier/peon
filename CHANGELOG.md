@@ -4,6 +4,28 @@
 
 ### Added
 
+- `guardrails.py` (Phase 3 - Policy / Guardrails) : regles composables du
+  Policy Engine. `PolicyRule` (`Protocol`, `Action -> Verdict | None`) et
+  cinq implementations - `ToolAuthorizationRule` (refuse un Tool absent du
+  `ToolRegistry`), `DangerousCommandRule` (motif `rm -rf` non cible, reprise
+  telle quelle de l'ancien `_check_dangerous_command`), `ArgumentsSchemaRule`
+  (valide `Action.arguments` contre `ToolSpec.parameters_schema`, resout le
+  point ouvert correspondant), `PathRestrictionRule` (restriction de chemin
+  optionnelle, opt-in via `workspace_root`), `RiskLevelRule` (regle
+  generique HIGH -> REQUIRES_CONFIRMATION, sinon ALLOWED, en dernier
+  recours).
+- `PolicyEngine.evaluate()` (`policy.py`) refactore pour composer cette
+  chaine ordonnee au lieu de porter lui-meme la logique de regle. Ordre
+  invariant preserve exactement (regle de commande dangereuse toujours
+  prioritaire sur la regle generique de `risk_level`). Constructeur etendu
+  de maniere additive (`rules=`, `workspace_root=`), le constructeur par
+  defaut `PolicyEngine(registry)` reproduisant exactement le comportement
+  observable pre-Phase 3 pour tout appelant existant.
+- `tests/test_guardrails.py` (20 tests) et extension de `tests/test_policy.py`
+  (13 tests) : chaque regle testee isolement, semantique de composition
+  (premiere regle gagnante, `None` laisse continuer, fail-closed si aucune
+  regle ne tranche), autorisation/schema/chemin via `PolicyEngine`.
+
 - `Checkpoint` model (`models/checkpoint.py`) : instantane composable (pas de
   duplication de champs) d'une `Mission` et de son eventuelle
   `ConfirmationRequest` en attente, suffisant pour reprendre le cas
@@ -26,7 +48,7 @@
 
 ### Tests
 
-295 passing
+328 passing
 
 ## 0.1.0
 

@@ -131,13 +131,80 @@ Composant dédié, séparé de la State Machine. Fonction pure :
   qui substitue l'action de sa propre initiative (même garantie que pour toute
   autre décision : le runtime ne se substitue jamais au LLM).
 
-Responsabilités actuelles : validation des permissions, détection des
-commandes dangereuses (`rm -rf`, `git push`, suppression massive...),
-déclenchement de la confirmation utilisateur. Peut consulter le **Tool
-Registry** (niveau de risque déclaré par l'outil) comme signal d'entrée.
-N'exécute rien, n'a aucun effet de bord. Conçu pour accueillir plus tard des
-règles supplémentaires (sandbox, quotas, modes d'exécution) sans toucher à la
-State Machine ni au Reasoner.
+Depuis la Phase 3 (Policy / Guardrails), `PolicyEngine.evaluate()` ne porte
+plus lui-même la logique de règle : il **compose une chaîne ordonnée de
+`PolicyRule`** (`guardrails.py`), chacune une fonction pure `Action ->
+Verdict | None`. `None` signifie « cette règle ne s'applique pas, la
+suivante est consultée » ; la **première règle qui rend un `Verdict`
+gagne** — un simple `for rule in self._rules: ... return verdict au premier
+non-None`. C'est la seule logique de décision de sécurité de tout le
+système : ni les Tools, ni `Workspace`, ni l'`Executor`, ni la
+`StateMachine` ne décident jamais si une `Action` est autorisée — ils
+reçoivent tous un `Verdict` déjà tranché.
+
+Ordre par défaut (`PolicyEngine(registry)`, invariant de sécurité — reproduit
+exactement le comportement pré-Phase 3, où la règle spécifique de commande
+dangereuse a toujours priorité sur la règle générique par `risk_level`) :
+
+1. **`ToolAuthorizationRule`** — refuse (`DENIED`) toute Action visant un
+   Tool absent du `ToolRegistry` injecté. « Autorisé » reste équivalent à
+   « connu du registre » : `ToolSpec` ne porte aujourd'hui aucun champ
+   d'autorisation distinct (voir `CONTEXT.md`, point ouvert correspondant).
+   Doit passer en premier : aucune autre règle n'a de sens sur un Tool
+   inconnu (elles ont toutes besoin de résoudre son `ToolSpec`).
+2. **`DangerousCommandRule`** — motif `rm -rf <cible>` non ciblé
+   (`DENIED` si absolu/non scopé, `REWRITE` sinon), reprise telle quelle de
+   l'ancien `_check_dangerous_command`. Volontairement minimale et
+   illustrative, indépendante du `ToolSpec` (inspecte directement
+   `Action.arguments["command"]`). Doit passer avant `RiskLevelRule` : c'est
+   l'invariant explicitement préservé de cette phase.
+3. **`ArgumentsSchemaRule`** *(nouvelle, Phase 3)* — valide `Action.arguments`
+   contre `ToolSpec.parameters_schema` (sous-ensemble minimal de JSON
+   Schema : `type: object`, `properties`, `required` ; `additionalProperties`
+   non spécifié reste permissif, comme la sémantique JSON Schema par défaut).
+   `DENIED` si un champ requis manque ou qu'un type ne correspond pas —
+   réutilise `DENIED` plutôt qu'un cinquième `Verdict` (voir plus bas).
+4. **`PathRestrictionRule`** *(nouvelle, Phase 3, opt-in)* — si
+   `PolicyEngine` est construit avec `workspace_root=...`, refuse
+   (`DENIED`) tout argument `path` qui résout en dehors de cette racine
+   (traversal `..` inclus). Ne s'applique qu'aux Tools dont le
+   `ToolSpec.parameters_schema` déclare une propriété `path` (déterminé
+   depuis le schéma, jamais depuis une liste de noms de Tools codée en dur).
+   Absente de la composition par défaut si `workspace_root` n'est pas fourni
+   — comportement historique (aucune restriction) préservé pour les
+   appelants existants.
+5. **`RiskLevelRule`** — règle générique de secours, toujours en dernier :
+   `HIGH` → `REQUIRES_CONFIRMATION`, sinon `ALLOWED`. Ignore
+   `Action.risk_level` et re-dérive le risque depuis le `ToolRegistry`
+   (comportement inchangé depuis avant cette phase).
+
+`PolicyEngine.__init__(registry, *, rules=None, workspace_root=None)` :
+`rules` permet d'injecter une composition entièrement custom (tests,
+scénarios avancés) ; sans lui, la liste ci-dessus est construite
+automatiquement. Le constructeur par défaut (`PolicyEngine(registry)`, seule
+forme utilisée par tous les appelants existants avant cette phase) construit
+la chaîne 1-2-3-5 (sans `PathRestrictionRule`), donc **reproduit
+exactement** le comportement observable pré-Phase 3 pour toute Action déjà
+valide au regard du schéma de son Tool. Si aucune règle de la composition ne
+tranche (chaîne personnalisée incomplète), `evaluate()` lève une
+`AssertionError` plutôt que d'autoriser silencieusement par défaut — choix
+délibéré de fail-closed pour un moteur de sécurité.
+
+Relation avec **Workspace** : `PathRestrictionRule` ne lit jamais
+`Workspace` pour connaître la racine autorisée — celle-ci est une donnée de
+configuration du `PolicyEngine` lui-même (`workspace_root`, un `Path` fourni
+par l'appelant, ex. futur `cli.py`). `Workspace` reste un port d'accès
+technique pur (Phase 2), jamais consulté pour une décision de sécurité :
+`PolicyEngine` décide si un chemin est acceptable, `Workspace` ne fait que
+l'I/O une fois l'Action déjà validée.
+
+Responsabilités actuelles : autorisation du Tool, détection de motif de
+commande dangereuse, validation structurelle des arguments, restriction de
+chemin optionnelle, déclenchement de la confirmation utilisateur par
+`risk_level`. N'exécute rien, n'a aucun effet de bord. Conçu pour accueillir
+plus tard des règles supplémentaires (sandbox, quotas, modes d'exécution) en
+ajoutant une nouvelle implémentation de `PolicyRule` à la chaîne, sans
+toucher à la State Machine ni au Reasoner.
 
 ### Executor
 Exécute une `Action` déjà validée (verdict `ALLOWED`, ou confirmation obtenue).
@@ -452,7 +519,8 @@ graph LR
     executor --> tool_registry
     executor --> tools[tools/]
 
-    policy --> tool_registry
+    policy --> guardrails[guardrails.py]
+    guardrails --> tool_registry
     tool_registry --> tools
     tools --> workspace[workspace.py]
 
@@ -460,6 +528,7 @@ graph LR
     context_builder --> models
     reasoner --> models
     policy --> models
+    guardrails --> models
     executor --> models
     event_log --> models
     storage --> models
@@ -469,6 +538,10 @@ Aucune dépendance circulaire : `runtime.py` dépend de tout, rien ne dépend de
 lui ; `event_log.py` et `storage.py` ne dépendent l'un de l'autre ni dans un
 sens ni dans l'autre. `workspace.py` ne dépend d'aucun autre module `peon.*`
 (uniquement `pathlib`/`subprocess` de la stdlib) ; seul `tools/` en dépend.
+`guardrails.py` (Phase 3) ne dépend que de `tool_registry.py` et `models/` —
+jamais de `workspace.py` : les règles de restriction de chemin résolvent des
+`Path` elles-mêmes, sans jamais consulter `Workspace`, qui reste ignorant de
+toute politique de sécurité.
 
 ## Machine d'états — table détaillée
 
@@ -586,8 +659,12 @@ ci-dessus), backend `Storage` sur disque (SQLite ou autre — seule
 multi-mission (un `Runtime` ne retient qu'un `Checkpoint`/une confirmation en
 attente à la fois), plan amont multi-étapes, Critic (hooks posés, aucun Critic
 écrit), Budget Manager, verdict `REWRITE` du Policy Engine, mémoire
-sémantique, multi-agents, Policy Engine au-delà de permissions/commandes
-dangereuses/confirmation (pas de sandbox ni de quotas pour l'instant).
+sémantique, multi-agents. Depuis la Phase 3, le Policy Engine couvre en plus
+l'autorisation par Tool, la validation d'arguments et une restriction de
+chemin optionnelle (voir **Policy Engine** ci-dessus) — restent hors
+périmètre : sandbox OS, quotas, allowlist exhaustive de commandes shell,
+timeout subprocess, MCP, CLI complète, SQLite, multi-mission, système de
+permissions au-delà de l'appartenance au `ToolRegistry`.
 
 ## Structure du projet
 
@@ -613,7 +690,11 @@ peon/
 │   │                        # policy.py (Verdict fourni par l'appelant, Runtime)
 │   ├── context_builder.py  # Observations ou Event Log -> Context (build / build_from_event_log)
 │   ├── reasoner.py         # Context -> Decision ; ABC Reasoner + LLMReasoner (appelle llm.py)
-│   ├── policy.py           # Action (+ Tool Registry) -> Verdict
+│   ├── policy.py           # PolicyEngine.evaluate() : compose la chaine ordonnee de
+│   │                        # PolicyRule (guardrails.py), Action -> Verdict
+│   ├── guardrails.py       # PolicyRule (Protocol) + regles composables : ToolAuthorizationRule,
+│   │                        # DangerousCommandRule, ArgumentsSchemaRule, PathRestrictionRule,
+│   │                        # RiskLevelRule (Phase 3)
 │   ├── executor.py         # Action validee -> ToolResult (resout le Tool via tool_registry.py)
 │   ├── tool_registry.py    # registre des Tools : descriptions, schemas, risk level, cost estimate
 │   ├── event_log.py        # journal append-only en memoire, zero dependance vers storage.py
@@ -675,3 +756,9 @@ Notes sur ce découpage :
   `state_machine.py`.
 - `models/verdict.py` (schéma du verdict) reste distinct de `policy.py`
   (logique qui le produit), pour ne pas confondre les deux dans les imports.
+- `guardrails.py` (Phase 3) reste distinct de `policy.py` : `guardrails.py`
+  porte les règles individuelles (`PolicyRule` + implémentations), `policy.py`
+  porte uniquement `PolicyEngine`, qui les compose et reste le seul point
+  d'entrée (`evaluate()`) consulté par le `Runtime`. Même logique de
+  séparation « collection de règles » / « moteur qui les orchestre » que pour
+  `state_machine.py` (transitions) vs les modèles `models/mission.py`.

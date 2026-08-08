@@ -1,66 +1,61 @@
-import re
+"""Point d'entree unique de toute decision de securite : `PolicyEngine.evaluate()`.
 
+`PolicyEngine` ne porte plus lui-meme de logique de regle : il enchaine une
+liste ordonnee de `PolicyRule` (guardrails.py). La premiere regle qui rend un
+`Verdict` gagne ; une regle qui rend `None` laisse la main a la suivante. Cet
+ordre est un invariant de securite, pas un detail d'implementation - voir
+ARCHITECTURE.md pour la justification de chaque position.
+"""
+
+from pathlib import Path
+
+from peon.guardrails import (
+    ArgumentsSchemaRule,
+    DangerousCommandRule,
+    PathRestrictionRule,
+    PolicyRule,
+    RiskLevelRule,
+    ToolAuthorizationRule,
+)
 from peon.models.action import Action
-from peon.models.tool_spec import RiskLevel
-from peon.models.verdict import Verdict, VerdictType
-from peon.tool_registry import ToolNotFoundError, ToolRegistry
-
-_RM_RF_PATTERN = re.compile(r"^rm -rf (\S+)$")
-_UNSAFE_TARGETS = {".", "..", "/", "~"}
-_UNSAFE_TARGET_PREFIXES = ("/", "~")
+from peon.models.verdict import Verdict
+from peon.tool_registry import ToolRegistry
 
 
 class PolicyEngine:
-    def __init__(self, registry: ToolRegistry) -> None:
-        self._registry = registry
-
-    def evaluate(self, action: Action) -> Verdict:
-        try:
-            # Seule .spec est lue : le Policy Engine ne doit jamais executer de Tool.
-            spec = self._registry.get(action.tool_name).spec
-        except ToolNotFoundError:
-            return Verdict(type=VerdictType.DENIED, reason=f"tool '{action.tool_name}' is not registered")
-
-        command_verdict = self._check_dangerous_command(action)
-        if command_verdict is not None:
-            return command_verdict
-
-        if spec.risk_level is RiskLevel.HIGH:
-            return Verdict(
-                type=VerdictType.REQUIRES_CONFIRMATION,
-                reason=f"tool '{spec.name}' is high risk",
-            )
-
-        return Verdict(
-            type=VerdictType.ALLOWED,
-            reason=f"tool '{spec.name}' is risk level '{spec.risk_level.value}', no blocking rule triggered",
-        )
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        *,
+        rules: list[PolicyRule] | None = None,
+        workspace_root: Path | str | None = None,
+    ) -> None:
+        self._rules = rules if rules is not None else self._default_rules(registry, workspace_root)
 
     @staticmethod
-    def _check_dangerous_command(action: Action) -> Verdict | None:
-        command = action.arguments.get("command")
-        if not isinstance(command, str):
-            return None
+    def _default_rules(registry: ToolRegistry, workspace_root: Path | str | None) -> list[PolicyRule]:
+        # Ordre invariant : autorisation du Tool d'abord (rien d'autre n'a de
+        # sens sur un Tool inconnu), puis la regle specifique (commande
+        # dangereuse) avant toute regle generique, puis validation
+        # structurelle des arguments, puis restriction de chemin (si une
+        # racine est configuree), et enfin le risk_level generique en
+        # dernier recours - c'est lui qui produit l'ALLOWED par defaut.
+        rules: list[PolicyRule] = [
+            ToolAuthorizationRule(registry),
+            DangerousCommandRule(),
+            ArgumentsSchemaRule(registry),
+        ]
+        if workspace_root is not None:
+            rules.append(PathRestrictionRule(registry, Path(workspace_root)))
+        rules.append(RiskLevelRule(registry))
+        return rules
 
-        match = _RM_RF_PATTERN.match(command.strip())
-        if match is None:
-            return None
-
-        target = match.group(1)
-        if target in _UNSAFE_TARGETS or target.startswith(_UNSAFE_TARGET_PREFIXES):
-            return Verdict(
-                type=VerdictType.DENIED,
-                reason=f"'{command}' targets an unscoped or absolute path, no safe rewrite exists",
-            )
-
-        safe_command = f"rm -rf -- ./{target}"
-        return Verdict(
-            type=VerdictType.REWRITE,
-            reason=f"'{command}' is an untargeted recursive delete, a scoped alternative is available",
-            suggested_action=Action(
-                reasoning=f"Policy Engine suggestion: prefer '{safe_command}' over '{command}'.",
-                tool_name=action.tool_name,
-                arguments={**action.arguments, "command": safe_command},
-                risk_level=RiskLevel.LOW,
-            ),
+    def evaluate(self, action: Action) -> Verdict:
+        for rule in self._rules:
+            verdict = rule.evaluate(action)
+            if verdict is not None:
+                return verdict
+        raise AssertionError(
+            f"no PolicyRule produced a Verdict for action '{action.tool_name}' - "
+            "a custom `rules=` composition is missing a catch-all rule"
         )

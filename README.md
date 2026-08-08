@@ -68,7 +68,8 @@ src/peon/
   providers/
     ollama.py              # OllamaLLM : premier fournisseur concret (API chat Ollama)
   prompts.py              # Context -> messages LLM (PromptBuilder)
-  policy.py               # Action (+ ToolRegistry) -> Verdict
+  policy.py               # PolicyEngine.evaluate() : compose la chaine de guardrails.py
+  guardrails.py           # PolicyRule (Protocol) + regles composables (Phase 3)
   executor.py             # Action validee -> ToolResult
   tool_registry.py         # registre des Tools disponibles
   event_log.py             # journal append-only en memoire
@@ -114,7 +115,13 @@ tests/                           # miroir de src/peon/ (+ tests d'integration bo
   entièrement au Policy Engine, jamais filtrée par le Tool lui-même). Chacun
   délègue l'accès technique au filesystem/`subprocess` à un `Workspace`
   injecté (`LocalWorkspace` aujourd'hui).
-- 295 tests passants (unitaires + intégration bout en bout).
+- Policy Engine composable (Phase 3) : `PolicyEngine.evaluate()` enchaîne une
+  liste ordonnée de règles (`guardrails.py`) — autorisation par Tool,
+  détection de commande dangereuse, validation des arguments contre le
+  schéma du Tool, restriction de chemin optionnelle, `risk_level` générique
+  en dernier recours. Toujours la seule autorité de sécurité : ni les Tools,
+  ni `Workspace`, ni l'Executor ne décident jamais si une Action est permise.
+- 328 tests passants (unitaires + intégration bout en bout).
 
 ## Limitations actuelles
 
@@ -136,9 +143,10 @@ tests/                           # miroir de src/peon/ (+ tests d'integration bo
   retient qu'un `Checkpoint`/une confirmation en attente à la fois.
 - **CLI minimale** : seulement `peon --version` ; aucune commande d'exécution
   de mission.
-- **Détection de commandes dangereuses volontairement minimale** dans le
-  Policy Engine (un seul motif, `rm -rf <cible>` non ciblé) — illustratif, pas
-  un moteur de règles complet.
+- **Détection de commandes dangereuses volontairement minimale** : le Policy
+  Engine est un moteur de règles composables (voir ci-dessus), mais la règle
+  de détection elle-même ne reconnaît toujours qu'un seul motif (`rm -rf
+  <cible>` non ciblé) — illustrative, pas une allowlist/blocklist exhaustive.
 - Pas de Critic (système de hooks) ni de Budget Manager : points d'extension
   identifiés dans `ARCHITECTURE.md`, non implémentés.
 - Pas d'outils `git`/`search`.

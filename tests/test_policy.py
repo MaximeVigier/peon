@@ -1,9 +1,12 @@
+from pathlib import Path
 from typing import Any
+
+import pytest
 
 from peon.models.action import Action
 from peon.models.tool_result import ToolResult
 from peon.models.tool_spec import RiskLevel, ToolSpec
-from peon.models.verdict import VerdictType
+from peon.models.verdict import Verdict, VerdictType
 from peon.policy import PolicyEngine
 from peon.tool_registry import ToolRegistry
 from peon.tools.base import Tool
@@ -78,3 +81,171 @@ def test_unknown_tool_is_denied() -> None:
     verdict = engine.evaluate(_action("does_not_exist"))
 
     assert verdict.type is VerdictType.DENIED
+
+
+def test_medium_risk_action_is_allowed() -> None:
+    engine = PolicyEngine(_registry(_StubTool("run_command", RiskLevel.MEDIUM)))
+
+    verdict = engine.evaluate(_action("run_command", command="echo hello"))
+
+    assert verdict.type is VerdictType.ALLOWED
+
+
+# --- Composition (guardrails.py, chaine ordonnee de PolicyRule) --------------
+
+
+class _AlwaysNoneRule:
+    def evaluate(self, action: Action) -> Verdict | None:
+        return None
+
+
+class _AlwaysDeniedRule:
+    def __init__(self, reason: str) -> None:
+        self._reason = reason
+
+    def evaluate(self, action: Action) -> Verdict | None:
+        return Verdict(type=VerdictType.DENIED, reason=self._reason)
+
+
+class _AlwaysAllowedRule:
+    def evaluate(self, action: Action) -> Verdict | None:
+        return Verdict(type=VerdictType.ALLOWED, reason="toujours autorise")
+
+
+def test_the_first_rule_that_returns_a_verdict_wins() -> None:
+    engine = PolicyEngine(
+        _registry(),
+        rules=[_AlwaysDeniedRule("premiere regle"), _AlwaysAllowedRule()],
+    )
+
+    verdict = engine.evaluate(_action("anything"))
+
+    assert verdict.type is VerdictType.DENIED
+    assert verdict.reason == "premiere regle"
+
+
+def test_a_rule_returning_none_lets_the_chain_continue() -> None:
+    engine = PolicyEngine(
+        _registry(),
+        rules=[_AlwaysNoneRule(), _AlwaysDeniedRule("deuxieme regle")],
+    )
+
+    verdict = engine.evaluate(_action("anything"))
+
+    assert verdict.type is VerdictType.DENIED
+    assert verdict.reason == "deuxieme regle"
+
+
+def test_no_rule_matching_fails_closed_instead_of_silently_allowing() -> None:
+    engine = PolicyEngine(_registry(), rules=[_AlwaysNoneRule()])
+
+    with pytest.raises(AssertionError):
+        engine.evaluate(_action("anything"))
+
+
+def test_dangerous_command_rule_takes_priority_over_the_generic_risk_level_rule() -> None:
+    # rm -rf non cible sur un Tool HIGH : sans priorite, la regle generique
+    # renverrait REQUIRES_CONFIRMATION avant meme d'atteindre la regle
+    # specifique - invariant explicitement demande par la roadmap Phase 3.
+    engine = PolicyEngine(_registry(_StubTool("run_command", RiskLevel.HIGH)))
+
+    verdict = engine.evaluate(_action("run_command", command="rm -rf /"))
+
+    assert verdict.type is VerdictType.DENIED
+
+
+# --- Arguments (ArgumentsSchemaRule, via PolicyEngine) ------------------------
+
+
+def _tool_with_path_schema(name: str, risk_level: RiskLevel) -> Tool:
+    return _StubToolWithSchema(
+        name,
+        risk_level,
+        {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+    )
+
+
+class _StubToolWithSchema(Tool):
+    def __init__(self, name: str, risk_level: RiskLevel, parameters_schema: dict[str, Any]) -> None:
+        self._spec = ToolSpec(
+            name=name,
+            description=f"Outil {name}",
+            parameters_schema=parameters_schema,
+            risk_level=risk_level,
+        )
+
+    @property
+    def spec(self) -> ToolSpec:
+        return self._spec
+
+    def execute(self, arguments: dict[str, Any]) -> ToolResult:
+        raise AssertionError("le Policy Engine ne doit jamais executer un Tool")
+
+
+def test_conforming_arguments_are_allowed() -> None:
+    engine = PolicyEngine(_registry(_tool_with_path_schema("read_file", RiskLevel.LOW)))
+
+    verdict = engine.evaluate(_action("read_file", path="README.md"))
+
+    assert verdict.type is VerdictType.ALLOWED
+
+
+def test_missing_required_argument_is_denied() -> None:
+    engine = PolicyEngine(_registry(_tool_with_path_schema("read_file", RiskLevel.LOW)))
+
+    verdict = engine.evaluate(_action("read_file"))
+
+    assert verdict.type is VerdictType.DENIED
+
+
+def test_wrong_argument_type_is_denied() -> None:
+    engine = PolicyEngine(_registry(_tool_with_path_schema("read_file", RiskLevel.LOW)))
+
+    verdict = engine.evaluate(_action("read_file", path=123))
+
+    assert verdict.type is VerdictType.DENIED
+
+
+# --- Paths (PathRestrictionRule, via PolicyEngine.workspace_root) ------------
+
+
+def test_path_inside_the_configured_root_is_allowed(tmp_path: Path) -> None:
+    engine = PolicyEngine(_registry(_tool_with_path_schema("read_file", RiskLevel.LOW)), workspace_root=tmp_path)
+
+    verdict = engine.evaluate(_action("read_file", path=str(tmp_path / "note.txt")))
+
+    assert verdict.type is VerdictType.ALLOWED
+
+
+def test_path_outside_the_configured_root_is_denied(tmp_path: Path) -> None:
+    engine = PolicyEngine(_registry(_tool_with_path_schema("read_file", RiskLevel.LOW)), workspace_root=tmp_path)
+
+    verdict = engine.evaluate(_action("read_file", path=str(tmp_path.parent / "elsewhere.txt")))
+
+    assert verdict.type is VerdictType.DENIED
+
+
+def test_path_traversal_attempt_is_denied(tmp_path: Path) -> None:
+    engine = PolicyEngine(_registry(_tool_with_path_schema("read_file", RiskLevel.LOW)), workspace_root=tmp_path)
+
+    verdict = engine.evaluate(_action("read_file", path="../outside.txt"))
+
+    assert verdict.type is VerdictType.DENIED
+
+
+def test_normal_relative_path_is_allowed(tmp_path: Path) -> None:
+    engine = PolicyEngine(_registry(_tool_with_path_schema("read_file", RiskLevel.LOW)), workspace_root=tmp_path)
+
+    verdict = engine.evaluate(_action("read_file", path="notes/today.md"))
+
+    assert verdict.type is VerdictType.ALLOWED
+
+
+def test_without_a_configured_root_no_path_restriction_applies(tmp_path: Path) -> None:
+    # Comportement par defaut (constructeur sans workspace_root) inchange :
+    # aucune restriction de chemin, comme avant cette phase.
+    engine = PolicyEngine(_registry(_tool_with_path_schema("read_file", RiskLevel.LOW)))
+
+    verdict = engine.evaluate(_action("read_file", path=str(tmp_path.parent / "elsewhere.txt")))
+
+    assert verdict.type is VerdictType.ALLOWED
