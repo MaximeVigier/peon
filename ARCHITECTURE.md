@@ -43,6 +43,12 @@ la `Mission` et l'éventuelle `ConfirmationRequest` en attente d'un
 la boucle de raisonnement : ce mécanisme réutilise `resume_confirmation()` et
 les transitions déjà existantes.
 
+Reçoit également un **Tracer** optionnel (`tracer=None` par défaut, voir
+**Tracer** ci-dessous) : instrumente `run()`, `resume_confirmation()`, l'appel
+au Reasoner et l'appel à l'Executor avec des spans techniques. Purement
+additif et invisible de l'extérieur — aucune Action, Observation ou Event
+n'est affectée par sa présence.
+
 ### Mission
 Unité de travail de haut niveau : objectif utilisateur, statut de cycle de vie
 (`en cours` / `succès` / `échec` / `max itérations`), compteur d'itérations et
@@ -352,6 +358,33 @@ qu'à l'Event Log lui-même (voir **Décisions validées**).
 > dans l'`ARCHITECTURE.md` racine d'AI-Lab_v2). Non conçue, non implémentée.
 > Event Log et Storage ne sont pas de la mémoire au sens de ce futur composant :
 > ce sont un journal d'exécution et sa persistance.
+
+### Tracer
+Port d'observabilité technique (`tracing.py`, Phase 4), strictement séparé du
+vocabulaire métier : `Runtime -> Tracer`, jamais `Runtime -> EventLog <-
+Tracer`. `Tracer` (ABC) expose un unique point d'entrée, `start_span(name,
+**attributes)`, un context manager qui fournit un `Span` (`set_attribute`,
+`record_exception`) ; l'ouverture/fermeture et la capture d'exception sont
+centralisées dans la classe de base (`Tracer.start_span`), pas dupliquées
+dans chaque implémentation — une exception levée pendant un span ferme
+toujours ce span avant de se propager. `NoOpTracer` est l'implémentation par
+défaut (`tracer=None` au constructeur du Runtime) : coût nul, aucun effet
+observable, comportement strictement identique à avant la Phase 4.
+
+Le Runtime instrumente quatre points déjà existants dans sa boucle : les deux
+points d'entrée publics (`runtime.run`, `runtime.resume_confirmation`) et les
+deux appels vers ses collaborateurs les plus coûteux (`reasoner.decide` —
+l'appel LLM — et `executor.run` — l'exécution d'un Tool, avec l'attribut
+technique `tool_name`). Aucun `EventType` ajouté, aucun événement de tracing
+journalisé dans l'`EventLog`, aucun changement à `Storage`/`Checkpoint`/
+`StateMachine`/`PolicyEngine`/`Executor`/Tools. Aucune donnée de tokens n'est
+émise : ni `LLM.generate()` ni `Reasoner.decide()` n'exposent d'information de
+consommation aujourd'hui — rien n'est fabriqué pour combler ce vide.
+
+Abstraction volontairement minimale : ni système de metrics/logging
+distribué, ni dépendance à OpenTelemetry à ce stade. Pensée pour qu'un futur
+adaptateur OpenTelemetry puisse s'y brancher (`Tracer`/`Span` comme port)
+sans réécriture du Runtime.
 
 ## Points d'extension (non implémentés dans le MVP)
 
@@ -700,6 +733,8 @@ peon/
 │   ├── event_log.py        # journal append-only en memoire, zero dependance vers storage.py
 │   ├── storage.py          # abstraction Storage (ABC) + InMemoryStorage (evenements et
 │   │                        # checkpoints), pas de backend disque
+│   ├── tracing.py          # port d'observabilite (Tracer/Span ABC + NoOpTracer, Phase 4) :
+│   │                        # Runtime -> Tracer, aucun couplage a EventLog/EventType
 │   ├── llm.py              # abstraction fournisseur LLM (ABC)
 │   ├── prompts.py          # PromptBuilder : Context -> messages LLM
 │   ├── workspace.py        # abstraction Workspace (ABC) + LocalWorkspace :

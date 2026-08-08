@@ -4,6 +4,30 @@
 
 ### Added
 
+- `tracing.py` (Phase 4 - Observability / tracing technique) : port
+  d'observabilite minimal, separe du vocabulaire metier - `Tracer`/`Span`
+  (ABC) + `NoOpTracer` par defaut. `Tracer.start_span(name, **attributes)`
+  est un context manager qui garantit la fermeture du span meme en cas
+  d'exception (try/except/finally centralise dans la classe de base, pas
+  duplique par implementation). Pas de dependance OpenTelemetry a ce stade -
+  abstraction pensee pour qu'un futur adaptateur OTel s'y branche sans
+  reecriture.
+- `Runtime` recoit un `tracer` optionnel (`tracer=None` par defaut,
+  comportement observable strictement inchange - voir `tests/test_tracing.py`,
+  test 1). Quatre points instrumentes : `run()`, `resume_confirmation()`,
+  l'appel au Reasoner (`reasoner.decide`, mesure l'appel LLM) et l'appel a
+  l'Executor (`executor.run`, attribut technique `tool_name`). Aucun
+  `EventType` ajoute, aucun evenement de tracing dans l'`EventLog`, aucun
+  changement a `Storage`/`Checkpoint`/`StateMachine`/`PolicyEngine`/
+  `Executor`/Tools. Pas de metriques de tokens : aucune source fiable
+  n'existe dans `LLM`/`Reasoner` aujourd'hui, rien n'est fabrique.
+- `tests/test_tracing.py` (9 tests) : comportement inchange sans tracer,
+  sequence de spans coherente (debut/fin bien imbriques) sur une mission
+  complete et sur `resume_confirmation()`, attribut `tool_name` du span
+  Executor, fermeture de span garantie sur exception (avec propagation),
+  `EventLog`/`Observation` strictement identiques avec ou sans tracer,
+  contrat `NoOpTracer` teste isolement du Runtime.
+
 - `guardrails.py` (Phase 3 - Policy / Guardrails) : regles composables du
   Policy Engine. `PolicyRule` (`Protocol`, `Action -> Verdict | None`) et
   cinq implementations - `ToolAuthorizationRule` (refuse un Tool absent du
@@ -48,7 +72,7 @@
 
 ### Tests
 
-328 passing
+337 passing
 
 ## 0.1.0
 

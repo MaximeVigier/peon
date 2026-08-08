@@ -511,7 +511,7 @@ texte d'`ARCHITECTURE.md`, valables telles quelles) :**
 
 ## 6. État actuel d'implémentation
 
-**Implémenté et testé (328 tests, tous verts) :**
+**Implémenté et testé (337 tests, tous verts) :**
 
 ```
 src/peon/
@@ -543,9 +543,11 @@ src/peon/
   prompts.py                             # PromptBuilder : Context -> messages LLM
   storage.py                             # ABC Storage + InMemoryStorage
                                           # (save_events/load_events, save_checkpoint/load_checkpoint)
+  tracing.py                             # Tracer/Span (ABC) + NoOpTracer (Phase 4 - observabilite) :
+                                          # port minimal, Runtime -> Tracer, aucun couplage a EventLog
   runtime.py                             # orchestrateur : assemble tous les composants ci-dessus,
                                           # + resume_confirmation, persist_events, load_event_log,
-                                          # save_checkpoint, resume_mission
+                                          # save_checkpoint, resume_mission ; accepte un Tracer optionnel
 ```
 
 Le cycle complet `Mission -> Context -> Reasoner -> Decision -> Policy Engine
@@ -615,6 +617,29 @@ tests : 295 -> 328 (20 nouveaux tests dans `tests/test_guardrails.py`, 13
 nouveaux dans `tests/test_policy.py`), zéro régression sur les 295 tests
 préexistants (aucun modifié).
 
+Mise à jour ultérieure (Phase 4 — Observability / tracing technique) :
+nouveau module `tracing.py` (`Tracer`/`Span` ABC + `NoOpTracer`), port
+d'observabilité minimal et volontairement séparé du vocabulaire métier
+(`Runtime -> Tracer`, jamais via l'`EventLog` — voir **Tracer** dans
+`ARCHITECTURE.md`). `Runtime` reçoit un `tracer` optionnel
+(`tracer=None` par défaut, comportement observable strictement inchangé) et
+instrumente quatre points déjà existants dans sa boucle : `run()`,
+`resume_confirmation()`, l'appel au Reasoner (`reasoner.decide`, span autour
+de l'appel LLM) et l'appel à l'Executor (`executor.run`, span avec l'attribut
+`tool_name`). Aucun `EventType` ajouté, aucun événement de tracing dans
+l'`EventLog`, aucun changement à `Storage`/`Checkpoint`/`StateMachine`/
+`PolicyEngine`/`Executor`/Tools. Pas de données de tokens : aucune source
+fiable n'existe aujourd'hui dans `LLM`/`Reasoner` (`LLM.generate()` retourne
+une chaîne brute, sans métadonnée d'usage), donc rien n'est fabriqué. Pas de
+dépendance OpenTelemetry à ce stade — abstraction pensée pour qu'un futur
+adaptateur OTel puisse s'y brancher sans réécriture. Compteur de tests : 328
+-> 337 (9 nouveaux dans `tests/test_tracing.py` : comportement inchangé sans
+tracer, séquence de spans cohérente sur une mission complète, spans imbriqués
+pour `resume_confirmation()`, fermeture de span garantie même sur exception,
+`EventLog`/`Observation` strictement identiques avec ou sans tracer,
+contrat `NoOpTracer` testé isolément), zéro régression sur les 328 tests
+préexistants (aucun modifié).
+
 ## 7. État actuel — travail restant identifié
 
 Pas de phase suivante choisie ici — cette section décrit uniquement ce qui
@@ -648,6 +673,12 @@ reste absent aujourd'hui, sans engager de priorité :
   mode d'exécution, voir section 5, point 28). Toute évolution en ce sens
   (ex. `DockerWorkspace`/`RemoteWorkspace`, autorisation plus fine que
   l'appartenance au `ToolRegistry`) reste à concevoir.
+- Adaptateur OpenTelemetry pour `tracing.py` (Phase 4) : le port `Tracer`/
+  `Span` est pensé pour ça, mais aucun adaptateur concret n'existe — seul
+  `NoOpTracer` est fourni. Métriques de tokens toujours absentes : bloquées
+  en amont par `LLM.generate()`/`Reasoner.decide()`, qui n'exposent aucune
+  information d'usage aujourd'hui ; à résoudre côté ces contrats avant de
+  pouvoir les faire remonter dans un span sans les fabriquer.
 
 Une nouvelle session doit **demander à l'utilisateur** quelle est la
 prochaine étape plutôt que d'en choisir une — conformément à la méthode de

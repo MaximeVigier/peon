@@ -29,6 +29,7 @@ from peon.state_machine import (
     ToolExecutionFinished,
     transition,
 )
+from peon.tracing import NoOpTracer, Tracer
 
 
 class UnknownConfirmationRequestError(Exception):
@@ -53,6 +54,7 @@ class Runtime:
         executor: Executor,
         event_log: EventLog,
         storage: Storage | None = None,
+        tracer: Tracer | None = None,
     ) -> None:
         self._context_builder = context_builder
         self._reasoner = reasoner
@@ -60,6 +62,7 @@ class Runtime:
         self._executor = executor
         self._event_log = event_log
         self._storage = storage
+        self._tracer = tracer if tracer is not None else NoOpTracer()
         self._observations: list[Observation] = []
         self._pending_confirmation: ConfirmationRequest | None = None
 
@@ -108,38 +111,42 @@ class Runtime:
         return checkpoint.mission
 
     def run(self, goal: str, *, max_iterations: int | None = None) -> Mission:
-        mission = Mission(goal=goal) if max_iterations is None else Mission(goal=goal, max_iterations=max_iterations)
-        self._observations = []
-        self._pending_confirmation = None
+        with self._tracer.start_span("runtime.run"):
+            mission = (
+                Mission(goal=goal) if max_iterations is None else Mission(goal=goal, max_iterations=max_iterations)
+            )
+            self._observations = []
+            self._pending_confirmation = None
 
-        self._log_event(EventType.MISSION_CREATED, {"mission_id": str(mission.id), "goal": mission.goal})
-        self._advance(mission, MissionCreated())
+            self._log_event(EventType.MISSION_CREATED, {"mission_id": str(mission.id), "goal": mission.goal})
+            self._advance(mission, MissionCreated())
 
-        self._run_reasoning_loop(mission)
+            self._run_reasoning_loop(mission)
 
-        return mission
+            return mission
 
     def resume_confirmation(self, mission: Mission, response: ConfirmationResponse) -> Mission:
-        request = self._take_pending_confirmation(mission, response)
+        with self._tracer.start_span("runtime.resume_confirmation"):
+            request = self._take_pending_confirmation(mission, response)
 
-        if response.granted:
-            self._log_event(
-                EventType.CONFIRMATION_GRANTED,
-                {"request_id": str(request.id), "tool_name": request.action.tool_name},
-            )
-            self._advance(mission, ConfirmationGranted())
-            self._execute_action(mission, request.action)
-        else:
-            self._log_event(
-                EventType.CONFIRMATION_DENIED,
-                {"request_id": str(request.id), "tool_name": request.action.tool_name, "note": response.note},
-            )
-            self._advance(mission, ConfirmationDenied())
-            self._record_observation(self._confirmation_denied_observation(request, response))
+            if response.granted:
+                self._log_event(
+                    EventType.CONFIRMATION_GRANTED,
+                    {"request_id": str(request.id), "tool_name": request.action.tool_name},
+                )
+                self._advance(mission, ConfirmationGranted())
+                self._execute_action(mission, request.action)
+            else:
+                self._log_event(
+                    EventType.CONFIRMATION_DENIED,
+                    {"request_id": str(request.id), "tool_name": request.action.tool_name, "note": response.note},
+                )
+                self._advance(mission, ConfirmationDenied())
+                self._record_observation(self._confirmation_denied_observation(request, response))
 
-        self._run_reasoning_loop(mission)
+            self._run_reasoning_loop(mission)
 
-        return mission
+            return mission
 
     def _take_pending_confirmation(self, mission: Mission, response: ConfirmationResponse) -> ConfirmationRequest:
         request = self._pending_confirmation
@@ -190,7 +197,8 @@ class Runtime:
             },
         )
 
-        decision = self._reasoner.decide(context)
+        with self._tracer.start_span("reasoner.decide"):
+            decision = self._reasoner.decide(context)
         self._log_event(EventType.DECISION_RECEIVED, {"kind": decision.kind})
 
         if isinstance(decision, FinishDecision):
@@ -232,7 +240,8 @@ class Runtime:
         )
 
     def _execute_action(self, mission: Mission, action: Action) -> None:
-        result = self._executor.run(action)
+        with self._tracer.start_span("executor.run", tool_name=action.tool_name):
+            result = self._executor.run(action)
 
         if isinstance(result, ExecutionError):
             self._log_event(

@@ -39,6 +39,10 @@ systématiquement sa réponse avant d'agir. Voir
   à partir d'observations déjà en main, soit directement depuis un `EventLog`.
 - **Storage abstraction** — interface `save_events`/`load_events` ;
   implémentation en mémoire fournie (`InMemoryStorage`).
+- **Tracer** — port d'observabilité technique optionnel (`tracer=None` par
+  défaut) : spans de durée autour de `run()`, `resume_confirmation()`, l'appel
+  au Reasoner et l'appel à l'Executor. Séparé du vocabulaire métier, aucun
+  couplage à l'`EventLog`.
 
 ## Lancer en local
 
@@ -75,6 +79,8 @@ src/peon/
   event_log.py             # journal append-only en memoire
   storage.py                # abstraction Storage + InMemoryStorage
                              # (evenements + checkpoints)
+  tracing.py                 # Tracer/Span (ABC) + NoOpTracer : port d'observabilite optionnel
+                              # (Runtime -> Tracer, separe de l'EventLog)
   tools/
     base.py                 # contrat Tool (ABC)
     filesystem.py             # ReadFileTool (read_file), ListDirectoryTool (list_directory)
@@ -121,7 +127,12 @@ tests/                           # miroir de src/peon/ (+ tests d'integration bo
   schéma du Tool, restriction de chemin optionnelle, `risk_level` générique
   en dernier recours. Toujours la seule autorité de sécurité : ni les Tools,
   ni `Workspace`, ni l'Executor ne décident jamais si une Action est permise.
-- 328 tests passants (unitaires + intégration bout en bout).
+- Tracer optionnel (`tracing.py`) : `Runtime(tracer=...)` mesure la durée de
+  `run()`, `resume_confirmation()`, de l'appel LLM (`reasoner.decide`) et de
+  l'exécution d'un Tool (`executor.run`) via des spans techniques ; `NoOpTracer`
+  par défaut, comportement strictement inchangé sans tracer, aucun couplage à
+  l'`EventLog`.
+- 337 tests passants (unitaires + intégration bout en bout).
 
 ## Limitations actuelles
 
@@ -150,3 +161,6 @@ tests/                           # miroir de src/peon/ (+ tests d'integration bo
 - Pas de Critic (système de hooks) ni de Budget Manager : points d'extension
   identifiés dans `ARCHITECTURE.md`, non implémentés.
 - Pas d'outils `git`/`search`.
+- **Tracer sans adaptateur concret** : seul `NoOpTracer` existe ; pas de
+  branchement OpenTelemetry, pas de métriques de tokens (aucune source fiable
+  n'existe dans `LLM`/`Reasoner` aujourd'hui).
