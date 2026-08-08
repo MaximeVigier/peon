@@ -677,6 +677,42 @@ sans checkpoint échoue proprement, `peon resume` retrouve et reprend un
 Checkpoint réel, absence de boucle ReAct dupliquée dans `cli.py`), zéro
 régression sur les 337 tests préexistants (aucun modifié).
 
+Mise à jour ultérieure (Phase 6 — correctif du chemin Tool -> Observation ->
+Context -> Prompt -> LLM) : bug découvert lors d'un test réel avec Ollama
+(`qwen3:14b`, `gpt-oss:20b`). `Runtime._execute_action` construisait déjà
+correctement l'`Observation` de succès avec `details = {"tool_name": ...,
+"output": result.output}` (le contenu réel de `ToolResult.output` survivait
+bien jusqu'au `Context`, via l'`EventLog` puis `ContextBuilder` — rien à
+corriger de ce côté), mais `PromptBuilder._render_observations()`
+(`prompts.py`) ne rendait que `observation.summary`, un texte générique
+("outil 'x' exécuté avec succès") pour toute `Observation` de kind
+`EXECUTION_RESULT`. Le LLM ne voyait donc jamais le contenu réel produit par
+un outil réussi (ex. stdout de `run_command`, contenu lu par `read_file`) et
+répétait l'action ou hallucinait un résultat jusqu'à `max_iterations`.
+Correctif contenu entièrement dans `prompts.py` : `_render_observations()`
+ajoute une ligne `resultat : ...` sous le résumé, uniquement pour les
+`Observation` de kind `EXECUTION_RESULT` dont `details["output"]` n'est ni
+absent ni `None` (chaîne affichée telle quelle, dict/liste sérialisés en JSON
+via `json.dumps(..., sort_keys=True)`), tronquée à `_MAX_OUTPUT_CHARS = 2000`
+caractères — aucune convention de troncature n'existait avant dans le code,
+valeur choisie arbitrairement plutôt que d'introduire une abstraction dédiée.
+Rendu des autres `ObservationKind` (`EXECUTION_ERROR`, `POLICY_REJECTION`,
+`CONFIRMATION_DENIED`) strictement inchangé : leur `summary` était déjà le
+contenu informatif complet (ex. `result.message` pour une erreur), donc
+inutile et risqué de dupliquer `details` dessus. Aucun changement à
+`Observation`/`Context`/`EventLog`/`Runtime`/`ContextBuilder`/`PolicyEngine`/
+`Executor`/`StateMachine`/`Storage`/`Checkpoint`/`Workspace`/`Tracer`.
+Compteur de tests : 344 -> 350 (5 nouveaux dans `tests/test_prompts.py` :
+sortie texte et sortie dict/JSON d'un résultat réussi visibles dans le
+prompt, troncature au-delà de la limite, rendu d'erreur inchangé, sortie
+`None`/absente ignorée ; 1 nouveau dans
+`tests/test_integration_reasoner_uses_tool_output.py`, scénario bout en bout
+où un `Reasoner` qui ne lit que le texte de prompt réellement construit par
+`PromptBuilder` — même contrat que `LLMReasoner`, sans dépendre d'un serveur
+Ollama — décide correctement au second tour grâce à la sortie du premier
+appel d'outil), zéro régression sur les 344 tests préexistants (aucun
+modifié).
+
 ## 7. État actuel — travail restant identifié
 
 Pas de phase suivante choisie ici — cette section décrit uniquement ce qui

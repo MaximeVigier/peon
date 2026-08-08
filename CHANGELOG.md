@@ -98,9 +98,34 @@
   (pas de sandboxing, pas de restriction de chemins, pas de timeout - hors
   perimetre de cette phase).
 
+### Fixed
+
+- `PromptBuilder._render_observations()` (`prompts.py`) : un `Observation` de
+  succes (`EXECUTION_RESULT`) ne transmettait au LLM que son `summary`
+  generique ("outil 'x' execute avec succes"), jamais le contenu reel de
+  `details["output"]` deja present dans le `Context` - decouvert lors d'un
+  test reel avec Ollama (le LLM ne voyait pas le resultat de
+  `run_command`/`read_file` et repetait l'action ou hallucinait jusqu'a
+  `max_iterations`). `_render_observations()` ajoute desormais une ligne
+  "resultat : ..." pour ces observations (string affichee telle quelle, dict/
+  liste serialises en JSON), tronquee a 2000 caracteres (`_MAX_OUTPUT_CHARS`,
+  nouvelle convention - aucune n'existait avant dans le code). Comportement
+  des autres `ObservationKind` (`EXECUTION_ERROR`, `POLICY_REJECTION`,
+  `CONFIRMATION_DENIED`) strictement inchange : leur `summary` etait deja le
+  contenu informatif complet. Aucun changement a `Observation`/`Context`/
+  `EventLog`/`Runtime`/`ContextBuilder`.
+- `tests/test_prompts.py` (5 nouveaux tests) et
+  `tests/test_integration_reasoner_uses_tool_output.py` (1 nouveau test,
+  boucle complete `Runtime` avec un Reasoner qui ne lit que le texte de
+  prompt reellement construit par `PromptBuilder`) : contenu reel d'un
+  resultat reussi visible dans le prompt (sortie texte et sortie
+  dict/JSON), troncature au-dela de la limite, rendu des erreurs inchange,
+  sortie `None`/absente ignoree, second tour de la boucle ReAct qui exploite
+  effectivement la sortie du premier appel d'outil.
+
 ### Tests
 
-344 passing
+350 passing
 
 ## 0.1.0
 

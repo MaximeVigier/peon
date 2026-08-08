@@ -21,8 +21,16 @@ schema JSON de chaque outil est serialise avec des cles triees).
 """
 
 import json
+from typing import Any
 
 from peon.models.context import Context
+from peon.models.observation import Observation, ObservationKind
+
+# Limite minimale pour eviter qu'un stdout/stderr ou un fichier volumineux ne
+# fasse exploser le prompt envoye au LLM. Pas de convention de troncature
+# preexistante ailleurs dans le code : valeur choisie arbitrairement, assez
+# large pour couvrir un usage normal (extrait de fichier, sortie de commande).
+_MAX_OUTPUT_CHARS = 2000
 
 _SYSTEM_PROMPT = """Tu es le Reasoner d'un runtime d'agent IA nomme Peon.
 
@@ -78,4 +86,39 @@ class PromptBuilder:
     def _render_observations(context: Context) -> list[str]:
         if not context.observations:
             return ["(aucune)"]
-        return [f"- [{observation.kind.value}] {observation.summary}" for observation in context.observations]
+        return [PromptBuilder._render_observation(observation) for observation in context.observations]
+
+    @staticmethod
+    def _render_observation(observation: Observation) -> str:
+        line = f"- [{observation.kind.value}] {observation.summary}"
+        rendered_output = PromptBuilder._render_output(observation)
+        if rendered_output is not None:
+            line += f"\n  resultat : {rendered_output}"
+        return line
+
+    @staticmethod
+    def _render_output(observation: Observation) -> str | None:
+        # Seul EXECUTION_RESULT porte un resultat d'outil reussi exploitable
+        # (details["output"], pose par Runtime._execute_action). Les autres
+        # kinds (erreur, rejet policy, confirmation refusee) restent inchanges :
+        # leur summary est deja le contenu informatif complet.
+        if observation.kind is not ObservationKind.EXECUTION_RESULT or observation.details is None:
+            return None
+        if "output" not in observation.details:
+            return None
+        output = observation.details["output"]
+        if output is None:
+            return None
+        return PromptBuilder._truncate(PromptBuilder._stringify(output))
+
+    @staticmethod
+    def _stringify(output: Any) -> str:
+        if isinstance(output, str):
+            return output
+        return json.dumps(output, ensure_ascii=False, sort_keys=True)
+
+    @staticmethod
+    def _truncate(text: str) -> str:
+        if len(text) <= _MAX_OUTPUT_CHARS:
+            return text
+        return f"{text[:_MAX_OUTPUT_CHARS]}... [tronque, {len(text)} caracteres au total]"
