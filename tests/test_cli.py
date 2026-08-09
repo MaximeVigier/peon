@@ -176,6 +176,38 @@ def test_run_with_an_invalid_max_iterations_fails_cleanly_instead_of_a_raw_valid
     assert "max_iterations" in result.output.lower() or "max-iterations" in result.output.lower()
 
 
+# --- peon run : configuration LLM invalide (--model/--base-url/--timeout-seconds) --
+
+
+def test_run_with_an_invalid_timeout_seconds_fails_cleanly_instead_of_a_raw_validation_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Meme classe de bug que test_run_with_a_blank_goal_..., mais sur la
+    # configuration Ollama : `_build_cli_runtime()` (donc `OllamaConfig`, qui
+    # exige timeout_seconds > 0) etait appele hors du bloc try/except
+    # ValidationError de `run()`, qui ne protege que `runtime.run(goal, ...)`.
+    # `--timeout-seconds 0` laissait donc fuir une trace Python brute.
+    _use_tools(monkeypatch, [])
+
+    result = runner.invoke(app, ["run", "objectif valide", "--timeout-seconds", "0"])
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, SystemExit)  # sortie propre, pas une trace Python non geree
+    assert "timeout_seconds" in result.output.lower()
+
+
+def test_run_with_an_empty_model_fails_cleanly_instead_of_a_raw_validation_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_tools(monkeypatch, [])
+
+    result = runner.invoke(app, ["run", "objectif valide", "--model", ""])
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, SystemExit)
+    assert "model" in result.output.lower()
+
+
 # --- peon run : confirmation ------------------------------------------------------
 
 
@@ -352,6 +384,24 @@ def test_resume_with_a_corrupted_event_log_file_fails_cleanly(
     assert result.exit_code != 0
     assert isinstance(result.exception, SystemExit)  # sortie propre, pas une trace Python non geree
     assert "corrupted" in result.output.lower()
+
+
+# --- peon resume : configuration LLM invalide --------------------------------
+
+
+def test_resume_with_an_invalid_timeout_seconds_fails_cleanly_instead_of_a_raw_validation_error() -> None:
+    # Meme bug que sur `run`, chemin resume() : `_build_cli_runtime()` y est
+    # appele hors de tout try/except (seuls CorruptedCheckpointError/
+    # CorruptedEventLogError l'entourent avant), donc un Checkpoint valide
+    # combine a `--timeout-seconds 0` laissait aussi fuir une trace brute.
+    mission = Mission(goal="deployer depuis un checkpoint")
+    cli._storage.save_checkpoint(Checkpoint(mission=mission))
+
+    result = runner.invoke(app, ["resume", "--timeout-seconds", "0"])
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, SystemExit)
+    assert "timeout_seconds" in result.output.lower()
 
 
 def test_resuming_after_a_mission_already_succeeded_does_not_reexecute_the_action(

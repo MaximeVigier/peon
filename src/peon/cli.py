@@ -187,7 +187,16 @@ def run(
     ),
 ) -> None:
     """Lance une mission jusqu'a son etat final, confirmations gerees en direct."""
-    runtime = _build_cli_runtime(model, base_url, timeout_seconds, workspace_root)
+    # OllamaConfig (providers/ollama.py) valide model/base_url/timeout_seconds
+    # via Pydantic : une valeur CLI invalide (ex. --timeout-seconds 0) levait
+    # une ValidationError brute avant meme d'atteindre runtime.run() ci-dessous,
+    # hors de portee de son propre bloc try/except. Meme convention que pour
+    # goal/max_iterations : message explicite, sortie propre.
+    try:
+        runtime = _build_cli_runtime(model, base_url, timeout_seconds, workspace_root)
+    except ValidationError as exc:
+        console.print(f"[bold red]Invalid LLM configuration.[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
     # Mission (models/mission.py) valide goal/max_iterations via Pydantic (goal
     # non vide, max_iterations >= 1) : une valeur CLI invalide levait jusque-la
     # une ValidationError brute au lieu d'un message et d'un exit_code=1
@@ -235,7 +244,15 @@ def resume(
     except CorruptedEventLogError as exc:
         console.print(f"[bold red]Event log file is corrupted.[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
-    runtime = _build_cli_runtime(model, base_url, timeout_seconds, workspace_root, event_log=event_log)
+    # Meme classe de bug que sur `run` (voir son commentaire) : la construction
+    # du Runtime doit rester protegee ici aussi, independamment des blocs
+    # try/except Storage ci-dessus qui ne couvrent que le chargement du
+    # Checkpoint/EventLog.
+    try:
+        runtime = _build_cli_runtime(model, base_url, timeout_seconds, workspace_root, event_log=event_log)
+    except ValidationError as exc:
+        console.print(f"[bold red]Invalid LLM configuration.[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
     mission = runtime.resume_mission(checkpoint)
 
     if runtime.pending_confirmation is not None:
