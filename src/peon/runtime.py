@@ -15,7 +15,7 @@ from peon.models.observation import Observation, ObservationKind
 from peon.models.tool_spec import RiskLevel
 from peon.models.verdict import Verdict, VerdictType
 from peon.policy import PolicyEngine
-from peon.reasoner import Reasoner
+from peon.reasoner import InvalidLLMResponseError, Reasoner
 from peon.storage import Storage
 from peon.state_machine import (
     ConfirmationDenied,
@@ -65,6 +65,13 @@ class Runtime:
         self._tracer = tracer if tracer is not None else NoOpTracer()
         self._observations: list[Observation] = []
         self._pending_confirmation: ConfirmationRequest | None = None
+        # Nombre d'evenements deja envoyes a Storage par persist_events() : un
+        # EventLog injecte deja peuple (Runtime.load_event_log(storage), cas
+        # d'une reprise) compte comme deja persiste, pour que le premier appel
+        # a persist_events() sur ce Runtime n'envoie que les evenements
+        # nouvellement produits pendant cette session, pas tout l'historique
+        # deja durable.
+        self._persisted_event_count = len(event_log.list_events())
 
     @property
     def observations(self) -> list[Observation]:
@@ -75,11 +82,19 @@ class Runtime:
         return self._pending_confirmation
 
     def persist_events(self) -> None:
-        # Instantane complet de l'EventLog courant vers Storage : pas de suivi
-        # incremental/delta, hors perimetre de cette phase (voir CONTEXT.md).
+        # N'envoie que les evenements pas encore persistes (delta depuis le
+        # dernier appel, suivi via self._persisted_event_count) : Storage.
+        # save_events() est un contrat append-only (voir InMemoryStorage/
+        # FileStorage), renvoyer l'EventLog complet a chaque appel dupliquerait
+        # tout ce qui a deja ete persiste. Rappelable plusieurs fois sur la
+        # meme session sans effet cumulatif indesirable.
         if self._storage is None:
             raise StorageNotConfiguredError("no Storage was injected into this Runtime")
-        self._storage.save_events(self._event_log.list_events())
+        all_events = self._event_log.list_events()
+        new_events = all_events[self._persisted_event_count :]
+        if new_events:
+            self._storage.save_events(new_events)
+        self._persisted_event_count = len(all_events)
 
     @staticmethod
     def load_event_log(storage: Storage) -> EventLog:
@@ -101,14 +116,27 @@ class Runtime:
         return checkpoint
 
     def resume_mission(self, checkpoint: Checkpoint) -> Mission:
-        # Restaure uniquement ce qu'un nouveau Runtime a besoin de savoir pour
-        # que resume_confirmation() fonctionne : la Mission et la confirmation
-        # en attente. Ne rejoue aucun evenement (EventLog reste vierge tant que
-        # load_event_log() n'est pas appele separement) et ne duplique aucune
-        # logique de la boucle ReAct existante.
+        # Restaure la Mission et la confirmation en attente depuis le
+        # Checkpoint, puis reconstruit self._observations depuis
+        # self._event_log via ContextBuilder.build_from_event_log -- la meme
+        # methode que le cycle de raisonnement utilise deja pour construire le
+        # Context a chaque tour (voir _run_reasoning_cycle). Aucune logique de
+        # replay separee : self._event_log est vierge par defaut (nouveau
+        # Runtime), mais redevient l'historique complet si l'appelant l'a
+        # peuple au prealable via Runtime.load_event_log(storage) et l'a
+        # injecte au constructeur -- resume_mission() ne fait alors que lire
+        # ce qui est deja la, il ne le charge pas lui-meme (composition.py /
+        # cli.py restent responsables de ce cablage).
         self._pending_confirmation = checkpoint.pending_confirmation
-        self._observations = []
-        return checkpoint.mission
+        mission = checkpoint.mission
+        context = self._context_builder.build_from_event_log(
+            mission_goal=mission.goal,
+            mission_status=mission.status,
+            mission_iteration_count=mission.iteration_count,
+            event_log=self._event_log,
+        )
+        self._observations = list(context.observations)
+        return mission
 
     def run(self, goal: str, *, max_iterations: int | None = None) -> Mission:
         with self._tracer.start_span("runtime.run"):
@@ -197,8 +225,12 @@ class Runtime:
             },
         )
 
-        with self._tracer.start_span("reasoner.decide"):
-            decision = self._reasoner.decide(context)
+        try:
+            with self._tracer.start_span("reasoner.decide"):
+                decision = self._reasoner.decide(context)
+        except InvalidLLMResponseError as exc:
+            self._fail_mission_on_reasoning_error(mission, exc)
+            return
         self._log_event(EventType.DECISION_RECEIVED, {"kind": decision.kind})
 
         if isinstance(decision, FinishDecision):
@@ -206,6 +238,15 @@ class Runtime:
             return
 
         self._handle_action_decision(mission, context, decision)
+
+    def _fail_mission_on_reasoning_error(self, mission: Mission, exc: InvalidLLMResponseError) -> None:
+        # Meme transition que _finish_mission(..., outcome="failure") : du point
+        # de vue de la State Machine, un raisonnement qui n'a pas pu produire de
+        # Decision est une defaillance de mission comme une autre, pas un etat
+        # nouveau. Aucune Action n'est executee et aucune Observation/Decision
+        # n'est fabriquee pour ce tour.
+        self._log_event(EventType.MISSION_FAILED, {"summary": str(exc), "reason": "reasoning_error"})
+        self._advance(mission, MissionFailed())
 
     def _finish_mission(self, mission: Mission, decision: FinishDecision) -> None:
         if decision.outcome == "success":

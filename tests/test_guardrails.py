@@ -5,6 +5,8 @@ laissant la main) et les cas deja couverts bout-en-bout via `PolicyEngine`
 restent dans `test_policy.py`, pour ne pas disperser inutilement les tests.
 """
 
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -207,6 +209,81 @@ def test_path_restriction_rule_does_not_apply_to_a_tool_without_a_path_parameter
     verdict = rule.evaluate(_action("run_command", command="rm -rf /"))
 
     assert verdict is None  # DangerousCommandRule s'en charge, pas celle-ci
+
+
+def test_path_restriction_rule_handles_a_nonexistent_path_inside_the_root(tmp_path: Path) -> None:
+    # Path.resolve() ne requiert pas que le chemin existe (strict=False par
+    # defaut) : un chemin qui n'a jamais ete cree doit rester autorise s'il
+    # se resout sous la racine, sans lever d'exception.
+    rule = PathRestrictionRule(_registry(_StubTool("read_file", RiskLevel.LOW, _PATH_SCHEMA)), tmp_path)
+
+    verdict = rule.evaluate(_action("read_file", path=str(tmp_path / "does" / "not" / "exist.txt")))
+
+    assert verdict is None
+
+
+def test_path_restriction_rule_handles_a_nonexistent_path_outside_the_root(tmp_path: Path) -> None:
+    rule = PathRestrictionRule(_registry(_StubTool("read_file", RiskLevel.LOW, _PATH_SCHEMA)), tmp_path)
+
+    verdict = rule.evaluate(_action("read_file", path=str(tmp_path.parent / "does" / "not" / "exist.txt")))
+
+    assert verdict is not None
+    assert verdict.type is VerdictType.DENIED
+
+
+def test_path_restriction_rule_denies_a_sibling_directory_sharing_a_name_prefix(tmp_path: Path) -> None:
+    # tmp_path="…/root", chemin candidat sous "…/root-evil" : un simple
+    # startswith() sur la representation texte confondrait les deux, mais la
+    # comparaison par Path.parents (utilisee par la regle) ne le fait pas.
+    sibling = tmp_path.parent / f"{tmp_path.name}-evil" / "note.txt"
+    rule = PathRestrictionRule(_registry(_StubTool("read_file", RiskLevel.LOW, _PATH_SCHEMA)), tmp_path)
+
+    verdict = rule.evaluate(_action("read_file", path=str(sibling)))
+
+    assert verdict is not None
+    assert verdict.type is VerdictType.DENIED
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="casse/separateurs specifiques a Windows")
+def test_path_restriction_rule_is_case_insensitive_and_slash_normalized_on_windows(tmp_path: Path) -> None:
+    # pathlib.WindowsPath compare par casefold et normalise '/'  vs '\\' :
+    # une variation de casse ou de separateur dans l'argument 'path' ne doit
+    # donc pas faire echapper artificiellement a la racine.
+    rule = PathRestrictionRule(_registry(_StubTool("read_file", RiskLevel.LOW, _PATH_SCHEMA)), tmp_path)
+
+    upper_case_path = str(tmp_path).upper() + "\\NOTE.TXT"
+    forward_slash_path = str(tmp_path).replace("\\", "/") + "/sub/note.txt"
+
+    assert rule.evaluate(_action("read_file", path=upper_case_path)) is None
+    assert rule.evaluate(_action("read_file", path=forward_slash_path)) is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="jonctions specifiques a Windows")
+def test_path_restriction_rule_denies_a_junction_that_escapes_the_root(tmp_path: Path) -> None:
+    # Une jonction NTFS a l'interieur de la racine mais pointant en dehors ne
+    # doit pas permettre d'echapper a la restriction : Path.resolve() suit la
+    # jonction jusqu'a sa cible reelle avant le containment check.
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+
+    junction = root / "escape"
+    created = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+        capture_output=True,
+        text=True,
+    )
+    if created.returncode != 0:
+        pytest.skip(f"impossible de creer une jonction NTFS dans cet environnement : {created.stderr}")
+
+    rule = PathRestrictionRule(_registry(_StubTool("read_file", RiskLevel.LOW, _PATH_SCHEMA)), root)
+
+    verdict = rule.evaluate(_action("read_file", path=str(junction / "secret.txt")))
+
+    assert verdict is not None
+    assert verdict.type is VerdictType.DENIED
 
 
 # --- RiskLevelRule ---------------------------------------------------------------

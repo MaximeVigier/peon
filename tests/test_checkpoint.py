@@ -1,4 +1,5 @@
 import uuid
+from pathlib import Path
 from typing import Any, Literal
 
 import pytest
@@ -18,7 +19,7 @@ from peon.models.tool_spec import RiskLevel, ToolSpec
 from peon.policy import PolicyEngine
 from peon.reasoner import Reasoner
 from peon.runtime import Runtime, StorageNotConfiguredError, UnknownConfirmationRequestError
-from peon.storage import InMemoryStorage, Storage
+from peon.storage import FileStorage, InMemoryStorage, Storage
 from peon.tool_registry import ToolRegistry
 from peon.tools.base import Tool
 
@@ -155,6 +156,40 @@ def test_crash_and_resume_restores_state_on_a_brand_new_runtime() -> None:
     assert runtime_b.pending_confirmation.action.tool_name == "git_push"
     # Nouveau Runtime = EventLog vierge : rien n'est rejoue automatiquement.
     assert event_log_b.list_events() == []
+
+
+def test_crash_and_resume_restores_state_through_two_distinct_file_storages(tmp_path: Path) -> None:
+    # Simule un vrai redemarrage de process : storage_b ne partage aucun etat
+    # Python avec storage_a, seulement le meme fichier sur disque.
+    checkpoint_path = tmp_path / "checkpoint.json"
+    storage_a = FileStorage(checkpoint_path)
+    registry = _registry(_StubTool("git_push", RiskLevel.HIGH))
+
+    runtime_a, _ = _runtime(registry, _ScriptedReasoner([_action_decision("git_push")]), storage=storage_a)
+    mission = runtime_a.run("publier les changements")
+    assert mission.status is MissionStatus.AWAITING_CONFIRMATION
+
+    runtime_a.save_checkpoint(mission)
+    del runtime_a, storage_a  # simule l'arret complet du process A
+
+    storage_b = FileStorage(checkpoint_path)
+    loaded_checkpoint = storage_b.load_checkpoint()
+    assert loaded_checkpoint is not None
+    assert loaded_checkpoint.mission.id == mission.id
+
+    runtime_b, event_log_b = _runtime(registry, _ScriptedReasoner([_finish("success")]), storage=storage_b)
+    resumed_mission = runtime_b.resume_mission(loaded_checkpoint)
+
+    assert resumed_mission.id == mission.id
+    assert resumed_mission.status is MissionStatus.AWAITING_CONFIRMATION
+    assert runtime_b.pending_confirmation is not None
+    assert runtime_b.pending_confirmation.action.tool_name == "git_push"
+    assert event_log_b.list_events() == []
+
+    result = runtime_b.resume_confirmation(
+        resumed_mission, ConfirmationResponse(request_id=runtime_b.pending_confirmation.id, granted=True)
+    )
+    assert result.status is MissionStatus.SUCCEEDED
 
 
 def test_save_checkpoint_without_storage_fails_cleanly() -> None:

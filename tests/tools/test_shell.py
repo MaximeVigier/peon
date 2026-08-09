@@ -1,3 +1,5 @@
+import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -71,3 +73,19 @@ def test_never_raises_for_any_invalid_arguments(arguments: dict[str, Any]) -> No
     result = ShellTool(_WORKSPACE).execute(arguments)
 
     assert result.success is False
+
+
+def test_execute_never_raises_for_a_command_producing_invalid_utf8_output(tmp_path: Path) -> None:
+    script = tmp_path / "invalid_utf8.py"
+    script.write_text(
+        "import sys\nsys.stdout.buffer.write(bytes([0x68, 0x69, 0xff, 0x21]))\n",
+        encoding="utf-8",
+    )
+    command = f'"{sys.executable}" "{script}"'
+
+    result = ShellTool(_WORKSPACE).execute({"command": command})
+
+    assert result.success is True
+    assert result.return_code == 0
+    assert isinstance(result.output["stdout"], str)
+    assert "�" in result.output["stdout"]

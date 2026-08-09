@@ -2,11 +2,14 @@
 apres arret/crash du process, sans dupliquer les champs de `Mission` ni de
 `ConfirmationRequest` (composition, pas recopie).
 
-Ne porte ni l'EventLog ni les Observations : la reprise complete de
-l'historique de raisonnement (event-sourcing/replay) reste hors perimetre de
-cette phase (voir ARCHITECTURE.md, "Hors perimetre du MVP"). Ce que porte un
-Checkpoint suffit exactement au cas cible de cette phase : reprendre un
-resume_confirmation() apres redemarrage.
+Ne porte ni l'EventLog ni les Observations, et ce n'est pas une lacune :
+l'historique complet est deja porte ailleurs, par `Storage.save_events()`/
+`load_events()`, reconstruit via `Runtime.load_event_log()` puis
+`ContextBuilder.build_from_event_log()` (voir ARCHITECTURE.md, section
+Storage). Dupliquer cet historique dans le Checkpoint reproduirait un etat
+deja disponible par une autre voie, pour un cout croissant a chaque
+`save_checkpoint()`. Un Checkpoint reste donc volontairement minimal :
+Mission + ConfirmationRequest en attente, rien de plus.
 """
 
 from datetime import datetime, timezone

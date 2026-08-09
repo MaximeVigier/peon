@@ -88,6 +88,48 @@ def test_persist_events_saves_the_full_event_log_to_storage() -> None:
     assert storage.load_events() == event_log.list_events()
 
 
+def test_persist_events_called_twice_does_not_duplicate_already_persisted_events() -> None:
+    # Storage.save_events est un contrat append-only (voir InMemoryStorage) :
+    # persist_events() doit donc suivre ce qui a deja ete envoye et n'envoyer
+    # que le delta, sinon un deuxieme appel duplique tout l'historique deja
+    # persiste par le premier.
+    registry = _registry(_StubTool("read_file"))
+    storage = InMemoryStorage()
+    event_log = EventLog()
+    runtime = Runtime(
+        context_builder=ContextBuilder(registry),
+        reasoner=_ScriptedReasoner(
+            [
+                ActionDecision(reasoning="lire", tool_name="read_file", arguments={}),
+                FinishDecision(outcome="success", summary="fini", confidence=1.0),
+            ]
+        ),
+        policy_engine=PolicyEngine(registry),
+        executor=Executor(registry),
+        event_log=event_log,
+        storage=storage,
+    )
+
+    runtime.run("lire un fichier")
+    runtime.persist_events()
+    first_persist_count = len(storage.load_events())
+    assert first_persist_count == len(event_log.list_events())
+
+    # Rien de nouveau ne s'est produit depuis : un deuxieme appel ne doit rien
+    # ajouter.
+    runtime.persist_events()
+    assert storage.load_events() == event_log.list_events()
+
+    # Un nouvel evenement s'ajoute a l'EventLog (comme le ferait un tour de
+    # raisonnement supplementaire) : seul ce delta doit etre envoye au
+    # prochain appel, pas tout l'historique deja persiste.
+    event_log.append(Event(type=EventType.MISSION_ABORTED))
+    runtime.persist_events()
+
+    assert storage.load_events() == event_log.list_events()
+    assert len(storage.load_events()) == first_persist_count + 1
+
+
 def test_load_event_log_replays_events_in_order() -> None:
     storage = InMemoryStorage()
     first = Event(type=EventType.MISSION_CREATED)

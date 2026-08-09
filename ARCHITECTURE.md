@@ -36,12 +36,20 @@ jamais un singleton global : le Runtime fonctionne sans lui, la persistance
 Expose également `save_checkpoint(mission)` (instantané explicite d'un
 **Checkpoint** vers `Storage`, à la demande — même philosophie que
 `persist_events()`, jamais automatique) et `resume_mission(checkpoint)` : un
-**nouveau** Runtime (nouvel `EventLog`, potentiellement vierge) restaure ainsi
-la `Mission` et l'éventuelle `ConfirmationRequest` en attente d'un
-`Checkpoint` chargé, sans rejouer l'historique — juste assez d'état pour que
-`resume_confirmation()` fonctionne normalement ensuite. Aucune duplication de
-la boucle de raisonnement : ce mécanisme réutilise `resume_confirmation()` et
-les transitions déjà existantes.
+**nouveau** Runtime restaure ainsi la `Mission` et l'éventuelle
+`ConfirmationRequest` en attente d'un `Checkpoint` chargé, puis reconstruit
+`self._observations` à partir de son propre `EventLog` via
+`ContextBuilder.build_from_event_log` — la même méthode que la boucle de
+raisonnement utilise déjà à chaque tour, aucune logique de replay séparée.
+Si cet `EventLog` est vierge (cas par défaut d'un nouveau Runtime),
+`resume_mission()` restaure alors juste assez d'état pour que
+`resume_confirmation()` fonctionne, comme avant. Si l'appelant l'a peuplé au
+préalable via `Runtime.load_event_log(storage)` (voir **Storage**
+ci-dessous), `resume_mission()` retrouve l'historique complet — un nouveau
+Runtime peut alors reconstruire un `Context` identique à celui qu'aurait eu
+le Runtime d'origine au même point. Aucune duplication de la boucle de
+raisonnement : ce mécanisme réutilise `resume_confirmation()`, les
+transitions et `ContextBuilder` déjà existants.
 
 Reçoit également un **Tracer** optionnel (`tracer=None` par défaut, voir
 **Tracer** ci-dessous) : instrumente `run()`, `resume_confirmation()`, l'appel
@@ -61,9 +69,11 @@ Implémenté (`models/checkpoint.py`). Instantané composable — compose une
 dupliquer leurs champs — suffisant pour reconstruire l'état nécessaire à une
 reprise après arrêt/crash du process, dans le cas ciblé par cette phase :
 `action -> REQUIRES_CONFIRMATION`. Ne porte ni l'`EventLog` ni les
-`Observation` (pas de persistance automatique des événements dans le
-checkpoint, pas d'event-sourcing/replay complet dans cette phase — hors
-périmètre, voir **Hors périmètre du MVP**). Modèle Pydantic sérialisable
+`Observation` — pas par lacune, mais parce que cet historique est déjà porté
+ailleurs (`Storage.save_events()`/`load_events()`, voir **Storage**
+ci-dessous) : le dupliquer dans le Checkpoint coûterait de plus en plus cher
+à chaque `save_checkpoint()` pour un état déjà disponible par une autre voie.
+Modèle Pydantic sérialisable
 (`model_dump_json()`/`model_validate_json()`), `frozen=True` au niveau du
 `Checkpoint` lui-même (il représente un instantané déjà pris, jamais
 recalculé après coup — même rationale que `Event`), même si la `Mission`
@@ -103,8 +113,49 @@ concrète : `LLMReasoner` (`reasoner.py`), qui délègue la construction du
 prompt à `PromptBuilder` (`Context -> messages`, dans `prompts.py`) et l'appel
 modèle à l'abstraction `LLM` (`llm.py`). Une réponse LLM invalide (JSON
 malformé, `kind` absent/inconnu, arguments incorrects) lève
-`InvalidLLMResponseError` ; cette exception n'est pas encore connectée au
-Runtime (voir `CONTEXT.md`, points ouverts).
+`InvalidLLMResponseError`, tout comme un échec de `LLM.generate()` lui-même
+(réseau, timeout, réponse fournisseur invalide), traduit dans cette même
+exception. Connectée au Runtime : une `InvalidLLMResponseError` qui atteint
+`Runtime` fait échouer proprement la Mission (`FAILED`) sans exécuter
+d'Action (voir `CONTEXT.md`).
+
+`RetryingReasoner` *(chantier « Reprise contrôlée après erreur LLM »)* :
+décorateur de `Reasoner` (`reasoner.py`), distinct de `LLMReasoner` —
+enveloppe n'importe quel `Reasoner` (y compris un stub de test, sans jamais
+avoir besoin de connaître Ollama ni aucun fournisseur concret) et retente
+`decide()` un nombre borné de fois (`max_attempts`, très faible, défaut 2)
+uniquement sur `InvalidLLMResponseError` ; toute autre exception remonte
+immédiatement, sans retry (un bug d'implémentation ne doit jamais être
+masqué). Aucun backoff, boucle strictement bornée (`for` sur `max_attempts`,
+jamais de récursion). Couche retenue précisément parce qu'elle est la seule
+à voir à la fois le contrat `Context -> Decision` et l'exception déjà
+normalisée par `reasoner.py` : ni `OllamaLLM`, ni `Runtime`, ni `CLI`, ni
+`LLMReasoner` lui-même ne portent cette politique. `Runtime` reste
+totalement inchangé et ignore qu'une reprise a eu lieu : il continue
+d'appeler `reasoner.decide(context)` une seule fois par cycle, avant toute
+construction d'`Action` (`Runtime._run_reasoning_cycle`) — c'est cette
+propriété structurelle, pas une simple discipline de code, qui garantit
+qu'aucune Action ni aucun Tool n'est jamais rejoué par ce mécanisme, quel
+que soit le nombre de tentatives internes au Reasoner.
+
+Reçoit également un `Tracer` optionnel (même convention que `Runtime`,
+défaut `NoOpTracer`) : ouvre un span `reasoner.decide.attempt` par
+tentative, avec les attributs `attempt`/`max_attempts` — distingue les
+tentatives dans le tracing sans toucher à l'`EventLog` ni ajouter de
+nouveau `EventType` métier. `build_runtime()` (`composition.py`) enveloppe
+désormais toujours `LLMReasoner` dans un `RetryingReasoner` par défaut ;
+`reasoner_max_attempts` et `tracer` sont de purs paramètres de câblage
+optionnels (`tracer` transmis identique à `Runtime` et à
+`RetryingReasoner`, pour que les spans d'une même exécution partagent le
+même `Tracer`).
+
+Reprise explicite via `Checkpoint` volontairement écartée pour ce cas : la
+CLI ne sauvegarde aujourd'hui un `Checkpoint` qu'au moment
+d'`AWAITING_CONFIRMATION`, jamais lors d'une panne de raisonnement, et
+`Checkpoint` ne porte ni l'`EventLog` ni les `Observation` (voir
+**Checkpoint** ci-dessus) — la rendre utile pour une panne LLM demanderait
+de lui faire porter l'historique de raisonnement, une refonte hors périmètre
+de ce chantier.
 
 ### State Machine
 Autorité unique de transition, fonction pure `(état, événement) -> état`,
@@ -199,13 +250,31 @@ délibéré de fail-closed pour un moteur de sécurité.
 Relation avec **Workspace** : `PathRestrictionRule` ne lit jamais
 `Workspace` pour connaître la racine autorisée — celle-ci est une donnée de
 configuration du `PolicyEngine` lui-même (`workspace_root`, un `Path` fourni
-par l'appelant). Non configuré aujourd'hui par `cli.py` (Phase 5) :
-`build_runtime()` (`composition.py`) n'expose pas encore ce paramètre —
-reste un point ouvert, pas une régression de cette phase. `Workspace` reste
-un port d'accès
+par l'appelant). Réellement branchée depuis `build_runtime()`
+(`composition.py`, `workspace_root: Path | str | None = None`, simple
+pass-through vers `PolicyEngine(registry, workspace_root=...)`) et depuis la
+CLI (`peon run "<goal>" --workspace-root <path>`, `peon resume
+--workspace-root <path>`, résolu — `Path.resolve()` — à la frontière CLI
+avant d'atteindre `build_runtime()`). `None` partout par défaut : aucune
+restriction, comportement historique inchangé pour tout appelant qui ne
+fournit pas cette option. `Workspace` reste un port d'accès
 technique pur (Phase 2), jamais consulté pour une décision de sécurité :
 `PolicyEngine` décide si un chemin est acceptable, `Workspace` ne fait que
 l'I/O une fois l'Action déjà validée.
+
+`PathRestrictionRule` gère `Path.resolve()` sans exiger que le chemin
+existe (`strict=False`, comportement par défaut de `pathlib`) : un chemin
+inexistant est résolu lexicalement puis comparé à la racine, sans lever
+d'exception. Les jonctions/symlinks Windows sont suivis par `resolve()`
+avant le containment check — une jonction créée *à l'intérieur* de la
+racine mais pointant vers une cible *extérieure* est donc correctement
+refusée (la comparaison porte sur la cible réelle, pas sur le chemin
+apparent), vérifié par test sur ce projet (développé et testé sous
+Windows). La comparaison `Path` (égalité et `parents`) est insensible à la
+casse et aux séparateurs sur Windows (`WindowsPath`), donc une variation de
+casse ou `/` vs `\` dans l'argument `path` n'échappe pas artificiellement à
+la restriction — comportement natif de `pathlib`, pas une logique ajoutée
+par cette règle.
 
 Responsabilités actuelles : autorisation du Tool, détection de motif de
 commande dangereuse, validation structurelle des arguments, restriction de
@@ -251,35 +320,73 @@ le `risk_level` `MEDIUM`, combiné à la détection de motifs dangereux du Polic
 Engine, est le mécanisme retenu plutôt qu'un `HIGH` systématique — voir
 **Policy Engine** ci-dessus).
 
-Depuis la Phase 2 (Workspace), aucun de ces trois Tools n'accède plus
+`DeleteFileTool` (`delete_file`, risque `HIGH`), également dans
+`tools/filesystem.py` — premier Tool de production dont le `risk_level` est
+réellement `HIGH` : supprime un unique fichier au chemin donné, opération
+destructive et irréversible. Même schéma de paramètres que `read_file`/
+`list_directory` (`path: string`, requis), ce qui suffit à le rendre
+automatiquement soumis à `PathRestrictionRule` quand un `workspace_root` est
+configuré (la règle s'applique à tout `ToolSpec` déclarant une propriété
+`path`, jamais à une liste de noms de Tools codée en dur — voir **Policy
+Engine** ci-dessus) sans qu'aucune règle nouvelle n'ait été nécessaire. Ne
+supprime jamais un dossier (l'opération technique sous-jacente,
+`Workspace.delete_file`, échoue proprement dans ce cas — voir **Workspace**
+ci-dessous) : périmètre volontairement borné à un seul fichier, cohérent avec
+« ne pas inventer une nouvelle surface dangereuse » plutôt qu'une suppression
+récursive de dossier.
+
+Depuis la Phase 2 (Workspace), aucun de ces quatre Tools n'accède plus
 directement au filesystem ou à `subprocess` : chacun reçoit un **Workspace**
 injecté au constructeur (`ReadFileTool(workspace)`,
-`ListDirectoryTool(workspace)`, `ShellTool(workspace)`) et lui délègue
-l'opération technique (`read_file`/`list_directory`/`run_command`). Le Tool
-garde la responsabilité métier — validation des arguments, choix du message
-d'erreur, construction du `ToolResult` — le Workspace ne fait que l'I/O brute.
-Ce découplage ne change ni le comportement observable ni le contrat
+`ListDirectoryTool(workspace)`, `ShellTool(workspace)`,
+`DeleteFileTool(workspace)`) et lui délègue l'opération technique
+(`read_file`/`list_directory`/`run_command`/`delete_file`). Le Tool garde la
+responsabilité métier — validation des arguments, choix du message d'erreur,
+construction du `ToolResult` — le Workspace ne fait que l'I/O brute. Ce
+découplage ne change ni le comportement observable ni le contrat
 `Tool.execute(arguments) -> ToolResult`.
 
 ### Workspace
 Port technique introduit en Phase 2 (`workspace.py`), interposé entre les
 Tools et le filesystem/processus réels : `Runtime → Executor → Tool →
 Workspace → filesystem/subprocess`. Interface `Workspace` (ABC) réduite aux
-trois opérations réellement utilisées par les Tools actuels — `read_file(path)
--> str`, `list_directory(path) -> list[str]`, `run_command(command) ->
-CommandResult` (`NamedTuple` : `stdout`, `stderr`, `return_code`) — plutôt
-qu'une API large anticipant des besoins non encore exprimés. Chaque méthode
-laisse remonter telles quelles les exceptions du comportement d'origine
-(`OSError`, `UnicodeDecodeError`) : c'est toujours le Tool appelant qui les
-capture et les traduit en `ToolResult`, exactement comme avant l'introduction
-de cette indirection.
+opérations réellement utilisées par les Tools actuels — `read_file(path) ->
+str`, `list_directory(path) -> list[str]`, `run_command(command) ->
+CommandResult` (`NamedTuple` : `stdout`, `stderr`, `return_code`),
+`delete_file(path) -> None` *(nouveau, chantier « Tool HIGH — delete_file »)*
+— plutôt qu'une API large anticipant des besoins non encore exprimés.
+`read_file`, `list_directory` et `delete_file` laissent remonter telles
+quelles les exceptions du comportement d'origine (`OSError`, et
+`UnicodeDecodeError` pour `read_file`) : c'est toujours le Tool appelant qui
+les capture et les traduit en `ToolResult`, exactement comme avant
+l'introduction de cette indirection — `delete_file` suit la même convention
+que `read_file`/`list_directory` dès son introduction, aucune divergence.
+`run_command` laisse également remonter `OSError`, mais ne lève plus
+`UnicodeDecodeError` depuis le chantier « Robustesse exécution Shell » (voir
+`CONTEXT.md`) : `stdout`/`stderr` restent garantis `str` même face à une
+sortie shell non-UTF-8, une sortie mal encodée restant un cas normal plutôt
+qu'une exception à faire remonter à `ShellTool`.
 
 `LocalWorkspace`, seule implémentation concrète à ce jour, reproduit
-exactement l'ancien comportement des Tools (`pathlib.Path.read_text`,
-`Path.iterdir`, `subprocess.run(..., shell=True, capture_output=True,
-text=True)`) : aucun sandboxing, aucune restriction de chemin, aucune
-allowlist de commandes, aucun timeout — ces sujets sont explicitement hors
-périmètre de la Phase 2 et appartiennent à une Phase 3 (sécurité) à venir.
+exactement l'ancien comportement des Tools pour `read_file`/`list_directory`
+(`pathlib.Path.read_text`, `Path.iterdir`) : aucun sandboxing, aucune
+restriction de chemin, aucune allowlist de commandes, aucun timeout — ces
+sujets sont explicitement hors périmètre de la Phase 2 et restent hors
+périmètre aujourd'hui. `delete_file` suit la même logique minimale
+(`Path(path).unlink()`) : aucune protection technique propre à `Workspace`
+(pas de corbeille, pas de sauvegarde) — la seule barrière avant l'effet de
+bord reste le `PolicyEngine` (`RiskLevelRule` + confirmation utilisateur) en
+amont de l'`Executor`, jamais `Workspace` lui-même, qui reste un port
+technique pur. `run_command` exécute via `subprocess.run(...,
+shell=True, capture_output=True, text=True, encoding="utf-8",
+errors="replace")` : `encoding="utf-8"` explicite aligne le décodage sur la
+convention déjà utilisée ailleurs dans le projet (`read_file`, `storage.py`)
+plutôt que de dépendre de l'encodage préféré du système d'exploitation
+(`locale.getpreferredencoding`, variable selon la machine et le mode UTF-8 de
+Python) ; `errors="replace"` remplace les octets invalides par le caractère
+de remplacement Unicode (`U+FFFD`) au lieu de lever `UnicodeDecodeError`.
+Comportement inchangé pour toute sortie déjà valide en UTF-8 ; `return_code`
+jamais affecté par cette gestion de décodage.
 `build_runtime()` (`composition.py`) n'a pas eu besoin d'évoluer : il ne
 construit jamais lui-même les `Tool`, il se contente d'enregistrer des
 instances déjà construites — c'est l'appelant (tests, `cli.py`) qui
@@ -331,26 +438,56 @@ avec `save_checkpoint(checkpoint: Checkpoint) -> None` et
 signatures et la sémantique de `save_events`/`load_events` restent
 inchangées. `Storage` connaît désormais aussi `Checkpoint` (donc, par
 composition, `Mission` et `ConfirmationRequest`), mais toujours aucune
-dépendance vers Runtime, Reasoner, Policy Engine ou Executor. Une seule
-implémentation concrète existe à ce jour, `InMemoryStorage` :
-`save_events`/`load_events` restent append-only (pas de suppression, pas de
-modification d'un événement existant), `load_events()` retourne toujours une
-copie, jamais la référence interne. `save_checkpoint`/`load_checkpoint` ne
-retiennent qu'un seul `Checkpoint` à la fois (remplacé à chaque appel, pas
-accumulé comme les événements — cohérent avec le périmètre mono-Mission de
-cette phase), et retournent également des copies profondes (une `Mission`
-étant mutable, contrairement à `Event`).
+dépendance vers Runtime, Reasoner, Policy Engine ou Executor. Deux
+implémentations concrètes existent à ce jour :
 
-**État réel (pas SQLite actuellement)** : aucune persistance disque n'existe
-encore — une Mission ne survit donc pas vraiment à un arrêt du process malgré
-l'abstraction en place. Un backend SQLite reste une implémentation future
-possible derrière la même interface `Storage`, non implémentée.
+- `InMemoryStorage` : `save_events`/`load_events` restent append-only (pas de
+  suppression, pas de modification d'un événement existant), `load_events()`
+  retourne toujours une copie, jamais la référence interne.
+  `save_checkpoint`/`load_checkpoint` ne retiennent qu'un seul `Checkpoint` à
+  la fois (remplacé à chaque appel, pas accumulé comme les événements —
+  cohérent avec le périmètre mono-Mission de cette phase), et retournent
+  également des copies profondes (une `Mission` étant mutable, contrairement
+  à `Event`). Tout est perdu à la fin du process.
+- `FileStorage` : persiste le `Checkpoint` **et** l'`EventLog` sur disque,
+  chacun dans son propre fichier. Le `Checkpoint` reste en JSON
+  (`Checkpoint.model_dump_json()`/`model_validate_json()`, déjà prévu par le
+  modèle), remplacé à chaque `save_checkpoint()` (même sémantique
+  mono-Checkpoint qu'`InMemoryStorage`), écrit de façon atomique (fichier
+  temporaire dans le même répertoire, puis `os.replace()`) après avoir créé
+  le répertoire parent si besoin. `load_checkpoint()` retourne `None` si le
+  fichier n'existe pas ; un contenu invalide lève `CorruptedCheckpointError`
+  plutôt que d'échouer silencieusement ou de retourner `None`.
+  Les événements sont persistés dans un fichier séparé, nommé d'après le
+  chemin du Checkpoint (`<checkpoint>.events.jsonl`, un seul paramètre au
+  constructeur suffit toujours), au format JSON Lines (un `Event` par ligne).
+  `save_events()` relit le fichier existant, ajoute les nouveaux événements
+  puis réécrit le tout de façon atomique (même pattern tempfile +
+  `os.replace()` que le Checkpoint) — un append-only cohérent avec le
+  contrat `Storage`, mais jamais un append brut en fin de fichier, pour
+  qu'un crash pendant l'écriture laisse le fichier précédent intact plutôt
+  qu'une dernière ligne tronquée. `load_events()` retourne `[]` si le
+  fichier n'existe pas ; une ligne qui n'est pas un JSON `Event` valide lève
+  `CorruptedEventLogError` (même famille que `CorruptedCheckpointError`).
+  Aucune dépendance externe : uniquement la stdlib (`tempfile`, `os`,
+  `pathlib`) et `pydantic`.
+
+**État réel** : le `Checkpoint` et l'`EventLog` survivent tous les deux à un
+arrêt du process via `FileStorage` (utilisé par défaut par `cli.py`). Un
+backend disque plus robuste pour les événements (SQLite ou autre) reste une
+implémentation future possible derrière la même interface `Storage`, mais
+n'est plus nécessaire pour qu'une reprise après crash retrouve son
+historique — voir **Runtime** ci-dessus (`resume_mission()`).
 
 C'est le **Runtime** qui fait le pont explicite entre **Event Log** et
-**Storage** (`persist_events()` / `load_event_log()`), en instantané complet
-à la demande — pas automatiquement à chaque événement ajouté, et sans suivi
-incrémental des événements déjà persistés (rappeler `persist_events()`
-plusieurs fois duplique ; point ouvert, voir plus bas). `event_log.py` et
+**Storage** (`persist_events()` / `load_event_log()`), en instantané à la
+demande — pas automatiquement à chaque événement ajouté. `persist_events()`
+suit en interne le nombre d'événements déjà envoyés (`self.
+_persisted_event_count`, initialisé à la taille de l'`EventLog` injecté au
+constructeur) et n'envoie que le delta à chaque appel : `Storage.
+save_events()` étant un contrat append-only, rappeler `persist_events()`
+plusieurs fois sur la même session ne duplique plus rien (ancien point
+ouvert, résolu). `event_log.py` et
 `storage.py` ne dépendent l'un de l'autre ni dans un sens ni dans l'autre —
 décision délibérément préservée en ajoutant cette capacité au Runtime plutôt
 qu'à l'Event Log lui-même (voir **Décisions validées**).
@@ -417,24 +554,51 @@ configuration) : options `--model`/`--base-url`/`--timeout-seconds` sur
 défaut explicites (`llama3.1`, `http://localhost:11434`, `60s`) codées en
 constantes de module.
 
-**Limite assumée du `Storage`** : la CLI garde un unique `InMemoryStorage`
-en mémoire du process (`cli._storage`), partagé entre `run` et `resume`.
-Cela permet à `peon resume` de retrouver un Checkpoint sauvegardé plus tôt
-**dans le même process** (utile pour les tests, ou une future intégration
-dans un process long-vivant), mais **pas** après un vrai redémarrage du
-process `peon` (chaque invocation shell de `peon` est un nouveau process
-Python, donc un `InMemoryStorage` vide) — aucune persistance disque n'a été
-fabriquée pour masquer cette limite ; un futur backend `Storage` la lèverait
-sans changer `cli.py`.
+**`Storage` de la CLI** *(mise à jour, phase Persistance disque du
+Checkpoint ; complétée par le chantier « reprise durable avec historique »)*
+: `cli._storage` est désormais un `FileStorage`
+(`_DEFAULT_CHECKPOINT_PATH = Path.home() / ".peon" / "checkpoint.json"`),
+partagé entre `run` et `resume`. `peon resume` retrouve donc un Checkpoint
+sauvegardé par une invocation `peon run` antérieure même après un vrai
+redémarrage du process `peon` (chaque invocation shell reste un nouveau
+process Python, mais le fichier sur disque persiste). Le `Checkpoint`
+**et** l'`EventLog` traversent désormais tous les deux un redémarrage :
+`peon resume` appelle `Runtime.load_event_log(_storage)` avant de
+construire son `Runtime` (voir **Storage** ci-dessus), donc `resume_mission()`
+reconstruit un `Context` identique à celui qu'aurait eu le process
+d'origine au même point, pas un `EventLog` vierge — limite précédemment
+documentée ici, désormais résolue (voir aussi **Runtime** ci-dessus).
 
-**Limite assumée du chemin de confirmation** : avec les trois `Tool` réels
-existants (`read_file`, `list_directory` en `LOW`, `run_command` en
-`MEDIUM`), `RiskLevelRule` ne déclenche jamais `REQUIRES_CONFIRMATION` en
-usage réel — seul un `Tool` `HIGH` le ferait, et aucun n'est encore livré
-(voir **Hors périmètre du MVP** : `tools/git.py` reste à écrire). Le chemin
-de confirmation de la CLI est implémenté et testé (via des `Tool` de test
-`HIGH`), prêt à s'activer sans changement dès qu'un `Tool` réel `HIGH` sera
-enregistré.
+**Chemin de confirmation réellement exercé** *(résolu par le chantier « Tool
+HIGH — delete_file »)* : avec les trois `Tool` livrés jusque-là (`read_file`,
+`list_directory` en `LOW`, `run_command` en `MEDIUM`), `RiskLevelRule` ne
+déclenchait jamais `REQUIRES_CONFIRMATION` en usage réel — limite documentée
+depuis la Phase 5, restée vraie jusqu'à l'ajout de `DeleteFileTool`
+(`delete_file`, risque `HIGH`, voir **Tool** ci-dessus). `_build_tools()`
+(`cli.py`) l'enregistre désormais aux côtés des trois autres : `peon run`/
+`peon resume` déclenchent réellement `AWAITING_CONFIRMATION` dès qu'une
+mission demande la suppression d'un fichier, sans qu'aucun changement n'ait
+été nécessaire au chemin de confirmation lui-même (déjà implémenté et testé
+via des `Tool` de test `HIGH` depuis la Phase 5) — exactement le scénario que
+cette limite anticipait. `tools/git.py` reste néanmoins à écrire (voir **Hors
+périmètre du MVP**), `delete_file` n'ayant comblé que le manque d'un `Tool`
+`HIGH` réel, pas l'ensemble des Tools envisagés.
+
+**Checkpoint jamais laissé pointer vers une confirmation déjà résolue**
+*(audit de consolidation, corrigé)* : `_drive_to_completion` (`cli.py`)
+persistait `Checkpoint`/`EventLog` uniquement en entrant dans la boucle
+d'attente de confirmation, jamais après l'avoir quittée. Une Mission qui se
+terminait (avec ou sans confirmation) sans qu'une nouvelle pause ne
+survienne laissait donc sur disque le dernier `Checkpoint` écrit — une
+`ConfirmationRequest` déjà résolue en mémoire. Un `peon resume` ultérieur
+(appel par erreur, script qui réessaie) la retrouvait telle quelle et
+ré-exécutait l'Action `HIGH` correspondante une deuxième fois, en violation
+directe de l'invariant « exactement une exécution » (voir **Tool**
+ci-dessus, `DeleteFileTool`). `_drive_to_completion` persiste désormais
+aussi l'état final (`save_checkpoint()` + `persist_events()`) après avoir
+quitté la boucle, quel que soit le nombre de tours qu'elle a fait — un
+`Checkpoint` sur disque reflète donc toujours l'état courant, jamais une
+pause déjà résolue (voir `tests/test_cli.py::test_resuming_after_a_mission_already_succeeded_does_not_reexecute_the_action`).
 
 ## Points d'extension (non implémentés dans le MVP)
 
@@ -474,7 +638,7 @@ graph TD
     Tools["Tools"]
     WS["Workspace<br/>(interface + LocalWorkspace)"]
     EL["Event Log<br/>(mémoire)"]
-    ST["Storage<br/>(interface + InMemoryStorage)"]
+    ST["Storage<br/>(interface + InMemoryStorage + FileStorage)"]
 
     Runtime --> CB
     Runtime --> Reasoner
@@ -733,21 +897,25 @@ actuelle). Non implémentés.
 
 ## Hors périmètre du MVP
 
-Event-sourcing complet (état dérivé des événements), reprise après crash par
-**replay complet de l'Event Log** (non branché — la Phase 1 checkpoint/reprise
-restaure la `Mission` et une `ConfirmationRequest` en attente via `Checkpoint`,
-pas l'historique complet des événements/observations ; voir **Checkpoint**
-ci-dessus), backend `Storage` sur disque (SQLite ou autre — seule
-`InMemoryStorage` existe, y compris pour les checkpoints), reprise
-multi-mission (un `Runtime` ne retient qu'un `Checkpoint`/une confirmation en
-attente à la fois), plan amont multi-étapes, Critic (hooks posés, aucun Critic
-écrit), Budget Manager, verdict `REWRITE` du Policy Engine, mémoire
-sémantique, multi-agents. Depuis la Phase 3, le Policy Engine couvre en plus
-l'autorisation par Tool, la validation d'arguments et une restriction de
-chemin optionnelle (voir **Policy Engine** ci-dessus) — restent hors
-périmètre : sandbox OS, quotas, allowlist exhaustive de commandes shell,
-timeout subprocess, MCP, CLI complète, SQLite, multi-mission, système de
-permissions au-delà de l'appartenance au `ToolRegistry`.
+Event-sourcing complet au sens strict (état de la `Mission`/`StateMachine`
+dérivé par fold des événements plutôt que tenu explicitement) reste hors
+périmètre — l'état continue d'être porté par `Mission`/`Checkpoint`, pas
+recalculé depuis l'`EventLog`. La reprise après crash restaure en revanche
+désormais l'historique complet : `Checkpoint` restaure la `Mission` et une
+`ConfirmationRequest` en attente, et `Storage.save_events()`/`load_events()`
+(persistées sur disque par `FileStorage`, voir **Storage** ci-dessus)
+permettent à `Runtime.resume_mission()` de reconstruire un `Context`
+identique à celui qu'aurait eu le process d'origine — voir **Runtime**
+ci-dessus. Restent hors périmètre : reprise multi-mission (un `Runtime` ne
+retient qu'un `Checkpoint`/une confirmation en attente à la fois), plan amont
+multi-étapes, Critic (hooks posés, aucun Critic écrit), Budget Manager,
+verdict `REWRITE` du Policy Engine, mémoire sémantique, multi-agents. Depuis
+la Phase 3, le Policy Engine couvre en plus l'autorisation par Tool, la
+validation d'arguments et une restriction de chemin optionnelle (voir
+**Policy Engine** ci-dessus) — restent hors périmètre : sandbox OS, quotas,
+allowlist exhaustive de commandes shell, timeout subprocess, MCP, CLI
+complète, SQLite, multi-mission, système de permissions au-delà de
+l'appartenance au `ToolRegistry`.
 
 ## Structure du projet
 
@@ -784,7 +952,8 @@ peon/
 │   ├── tool_registry.py    # registre des Tools : descriptions, schemas, risk level, cost estimate
 │   ├── event_log.py        # journal append-only en memoire, zero dependance vers storage.py
 │   ├── storage.py          # abstraction Storage (ABC) + InMemoryStorage (evenements et
-│   │                        # checkpoints), pas de backend disque
+│   │                        # checkpoints, memoire) + FileStorage (checkpoint persiste
+│   │                        # sur disque en JSON, evenements toujours en memoire)
 │   ├── tracing.py          # port d'observabilite (Tracer/Span ABC + NoOpTracer, Phase 4) :
 │   │                        # Runtime -> Tracer, aucun couplage a EventLog/EventType
 │   ├── llm.py              # abstraction fournisseur LLM (ABC)
@@ -799,8 +968,8 @@ peon/
 │   ├── tools/
 │   │   ├── __init__.py
 │   │   ├── base.py
-│   │   ├── filesystem.py   # ReadFileTool (read_file, LOW), ListDirectoryTool (list_directory, LOW)
-│   │   │                    # -- toutes deux injectees avec un Workspace
+│   │   ├── filesystem.py   # ReadFileTool (read_file, LOW), ListDirectoryTool (list_directory, LOW),
+│   │   │                    # DeleteFileTool (delete_file, HIGH) -- toutes trois injectees avec un Workspace
 │   │   └── shell.py        # ShellTool (run_command, MEDIUM) -- injecte avec un Workspace
 │   │
 │   └── models/              # schemas Pydantic partages entre composants
@@ -829,9 +998,11 @@ possibles, mentionnées dans `CONTEXT.md`.
 
 Notes sur ce découpage :
 
-- `storage/` (sous-package) reste `storage.py` (module unique) : la
-  responsabilité est assez étroite (une ABC + une implémentation mémoire) pour
-  ne pas justifier un sous-package tant qu'un second backend (SQLite ou autre)
+- `storage/` (sous-package) reste `storage.py` (module unique) : même avec
+  deux implémentations concrètes (`InMemoryStorage`, `FileStorage`), la
+  responsabilité reste assez étroite (une ABC + deux implémentations, l'une
+  déléguant à l'autre pour les événements) pour ne pas justifier un
+  sous-package tant qu'un backend événements-sur-disque (SQLite ou autre)
   n'est pas envisagé.
 - `memory.py` a disparu du découpage — remplacé par le couple
   `event_log.py` (mémoire, pendant l'exécution) / `storage.py` (persistance
