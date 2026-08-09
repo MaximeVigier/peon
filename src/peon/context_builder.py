@@ -41,7 +41,9 @@ class ContextBuilder:
         event_log: EventLog,
     ) -> Context:
         observations = [
-            self._to_observation(event) for event in event_log.list_events_by_type(EventType.OBSERVATION_PRODUCED)
+            self._to_observation(event)
+            for event in self._current_mission_events(event_log)
+            if event.type is EventType.OBSERVATION_PRODUCED
         ]
         return self.build(
             mission_goal=mission_goal,
@@ -49,6 +51,27 @@ class ContextBuilder:
             mission_iteration_count=mission_iteration_count,
             observations=observations,
         )
+
+    @staticmethod
+    def _current_mission_events(event_log: EventLog) -> list[Event]:
+        # Storage.save_events() est append-only pour toujours, sans notion de
+        # Mission (voir storage.py) : une EventLog rechargee depuis un Storage
+        # partage entre plusieurs invocations `peon run` successives peut donc
+        # porter l'historique de plusieurs Missions bout a bout, alors que
+        # Checkpoint ne retient jamais que la derniere (mono-mission). Seuls
+        # les evenements survenus depuis le plus recent MISSION_CREATED
+        # appartiennent a la Mission en cours de reprise ; sans ce filtrage,
+        # les Observation d'une Mission anterieure et sans rapport fuiteraient
+        # dans le Context reconstruit (voir tests/test_resume_history.py,
+        # cas 5). Aucun MISSION_CREATED trouve (EventLog construite a la main
+        # par un test, ou historique legacy) : comportement inchange, tous les
+        # evenements sont consideres comme appartenant a la Mission courante.
+        all_events = event_log.list_events()
+        start = 0
+        for index, event in enumerate(all_events):
+            if event.type is EventType.MISSION_CREATED:
+                start = index
+        return all_events[start:]
 
     @staticmethod
     def _to_observation(event: Event) -> Observation:

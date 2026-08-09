@@ -152,6 +152,30 @@ tests/                           # miroir de src/peon/ (+ tests d'integration bo
   (`Runtime.load_event_log()`, câblé dans `peon resume`), le Context reconstruit
   après reprise est identique à celui qu'aurait eu le process d'origine au
   même point.
+- Idempotence durable d'une Action `HIGH` confirmée (chantier ultérieur) :
+  `Runtime.resume_confirmation()` rend désormais l'état durable juste avant
+  *et* juste après avoir réellement exécuté l'Action confirmée (quand un
+  `Storage` est injecté) — un crash du process pendant ou immédiatement après
+  cette exécution ne peut plus jamais faire retrouver à `peon resume` la même
+  `ConfirmationRequest` "en attente" ni ré-exécuter l'Action (ex.
+  `delete_file`) une deuxième fois. Aucun nouveau champ sur `Checkpoint`,
+  compatible avec les Checkpoints existants.
+- Isolation multi-Mission du `Context` reconstruit (audit d'isolation
+  multi-Mission) : `cli._storage` étant partagé entre toutes les
+  invocations `peon run` successives, une `EventLog` rechargée pouvait
+  porter l'historique de plusieurs Missions bout à bout ;
+  `ContextBuilder.build_from_event_log()` ne retient désormais que les
+  `Observation` survenues depuis le plus récent `MISSION_CREATED` — les
+  Observations d'une Mission antérieure, déjà terminée, ne fuient plus dans
+  le Context reconstruit pour la reprise d'une Mission suivante. N'ajoute
+  aucune reprise multi-mission (toujours hors périmètre, voir
+  Limitations ci-dessous) : corrige uniquement cette reconstruction.
+- `peon run` avec des paramètres de Mission invalides échoue proprement :
+  un `goal` vide/blanc ou un `--max-iterations` invalide (`< 1`) affichent
+  désormais `Invalid mission parameters.` et sortent en erreur
+  (`exit_code=1`) au lieu de laisser fuir une trace Python brute
+  (`pydantic.ValidationError`), même convention que les erreurs `Storage`
+  déjà gérées par `peon resume`.
 - `OllamaLLM` (`providers/ollama.py`) : premier fournisseur `LLM` concret,
   appelle l'API chat d'Ollama en HTTP ; assemblé avec le reste du pipeline via
   `composition.py` (`build_runtime()`).
@@ -193,7 +217,7 @@ tests/                           # miroir de src/peon/ (+ tests d'integration bo
   via `build_runtime(..., workspace_root=...)` — tout argument `path` en
   dehors de cette racine est refusé par le Policy Engine. Opt-in : sans
   l'option, comportement historique inchangé (aucune restriction).
-- 441 tests passants (unitaires + intégration bout en bout).
+- 456 tests passants (unitaires + intégration bout en bout).
 
 ## Limitations actuelles
 
@@ -221,7 +245,12 @@ tests/                           # miroir de src/peon/ (+ tests d'integration bo
   replay artificiel : `ContextBuilder.build_from_event_log()` est la même
   méthode que la boucle de raisonnement utilise déjà à chaque tour. Pas de
   multi-mission : un `Runtime` ne retient qu'un `Checkpoint`/une confirmation
-  en attente à la fois.
+  en attente à la fois — un `Storage` (`FileStorage` de la CLI) partagé
+  entre plusieurs Missions séquentielles reste néanmoins isolé au niveau du
+  `Context` reconstruit (voir ci-dessus, audit d'isolation multi-Mission) :
+  seule la capacité du `Runtime`/`Checkpoint` à suivre plusieurs Missions à
+  la fois reste hors périmètre, pas la correction d'un Context reconstruit
+  mélangeant deux Missions.
 - **CLI minimale** : `peon --version`, `peon run "<goal>"`, `peon resume` —
   pas de sous-commandes de configuration. Une erreur réseau/HTTP Ollama ne
   remonte plus brute : `LLMReasoner` la traduit en `InvalidLLMResponseError`,
@@ -233,7 +262,9 @@ tests/                           # miroir de src/peon/ (+ tests d'integration bo
   l'`EventLog` persisté). Une erreur de `Storage` (`Checkpoint`/`EventLog`
   corrompu sur disque) produit un message dédié côté `peon resume`
   (`Checkpoint file is corrupted.` / `Event log file is corrupted.`) plutôt
-  qu'une trace Python brute. `--workspace-root` existe sur les deux
+  qu'une trace Python brute ; côté `peon run`, un `goal` vide/blanc ou un
+  `--max-iterations` invalide produit de même `Invalid mission parameters.`
+  plutôt qu'une `pydantic.ValidationError` brute. `--workspace-root` existe sur les deux
   commandes mais n'est pas persistée dans le `Checkpoint` : `peon resume`
   doit la refournir pour qu'elle s'applique aux Actions de la boucle de
   raisonnement reprise.

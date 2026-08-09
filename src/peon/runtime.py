@@ -163,6 +163,17 @@ class Runtime:
                     {"request_id": str(request.id), "tool_name": request.action.tool_name},
                 )
                 self._advance(mission, ConfirmationGranted())
+                # Rend durable, AVANT le moindre effet de bord reel (Executor.run
+                # via _execute_action ci-dessous), le fait que cette
+                # ConfirmationRequest est deja consommee : pending_confirmation
+                # est deja None en memoire (_take_pending_confirmation ci-dessus)
+                # et ce Checkpoint l'ecrit sur disque tel quel. Un crash pendant
+                # ou juste apres l'execution de l'Action ne peut donc plus jamais
+                # faire retrouver a `peon resume` la meme ConfirmationRequest "en
+                # attente" - seule condition qui permettrait de rejouer
+                # resume_confirmation() sur cette Action (voir ARCHITECTURE.md,
+                # section Runtime / idempotence d'une confirmation HIGH).
+                self._checkpoint_if_configured(mission)
                 self._execute_action(mission, request.action)
             else:
                 self._log_event(
@@ -172,9 +183,31 @@ class Runtime:
                 self._advance(mission, ConfirmationDenied())
                 self._record_observation(self._confirmation_denied_observation(request, response))
 
+            # Meme point apres coup, que la confirmation ait ete accordee ou
+            # refusee : rend durable l'issue (Action executee ou refus
+            # enregistre) avant de rendre la main a la boucle de raisonnement,
+            # qui peut elle-meme enchainer plusieurs tours avant la prochaine
+            # pause naturelle (AWAITING_CONFIRMATION suivante ou fin de
+            # Mission) - sans ce deuxieme point, un crash pendant ces tours
+            # laisserait le Checkpoint sur disque bloque sur l'etat d'avant
+            # cette confirmation, avec le meme risque de rejeu.
+            self._checkpoint_if_configured(mission)
+
             self._run_reasoning_loop(mission)
 
             return mission
+
+    def _checkpoint_if_configured(self, mission: Mission) -> None:
+        # No-op si aucun Storage n'est injecte : comportement historique
+        # inchange pour tout Runtime construit sans persistance (save_checkpoint()/
+        # persist_events() leveraient StorageNotConfiguredError si appeles
+        # directement dans ce cas - voir leurs docstrings). Reutilise ces deux
+        # memes methodes publiques deja existantes, jamais une nouvelle
+        # primitive de persistance ni un nouveau champ sur Checkpoint.
+        if self._storage is None:
+            return
+        self.save_checkpoint(mission)
+        self.persist_events()
 
     def _take_pending_confirmation(self, mission: Mission, response: ConfirmationResponse) -> ConfirmationRequest:
         request = self._pending_confirmation

@@ -571,6 +571,59 @@ texte d'`ARCHITECTURE.md`, valables telles quelles) :**
     (`WindowsPath`, natif à `pathlib`, pas une logique ajoutée par cette
     règle). Chemins UNC (`\\serveur\partage\...`) toujours non testés
     explicitement — reste un point ouvert mineur si un jour pertinent.
+30. ~~Entre la confirmation d'une Action `HIGH` et la persistance normale
+    suivante (`cli.py::_drive_to_completion`), un crash pouvait laisser sur
+    disque un `Checkpoint` `AWAITING_CONFIRMATION` déjà résolu en mémoire :
+    un `peon resume` ultérieur retrouvait la même `ConfirmationRequest`
+    "en attente" et réexécutait l'Action `HIGH` (ex. `delete_file`) une
+    deuxième fois.~~ — résolu (chantier « Idempotence durable d'une Action
+    HIGH après confirmation ») : `Runtime.resume_confirmation()` persiste
+    désormais l'état (Checkpoint + delta d'EventLog) juste avant *et* juste
+    après `_execute_action()`, quand un `Storage` est injecté — voir
+    `ARCHITECTURE.md`, section **Runtime**. Reste ouvert, assumé et documenté
+    plutôt que masqué : si le crash survient exactement pendant
+    `Executor.run()` ou pendant l'écriture du second point de persistance
+    (fenêtre résiduelle inévitable sans coupler transactionnellement le Tool
+    à l'écriture disque — hors périmètre de ce chantier, et non demandé), la
+    Mission reste durablement "garée" en `EXECUTING`/`REASONING` : plus
+    aucune double exécution possible (`pending_confirmation` déjà `None` sur
+    disque), mais `peon resume` ne relance pas non plus automatiquement la
+    boucle de raisonnement dans ce cas précis — il n'existe aujourd'hui
+    aucune API publique pour reprendre le raisonnement sans
+    `ConfirmationRequest` en attente (limite déjà présente de
+    `cli.py::resume`, inchangée par ce chantier, pas une régression). Une
+    vraie continuation automatique de la Mission depuis cet état "garé"
+    resterait à concevoir si elle devient nécessaire.
+31. Risque distinct du point 27 (`Runtime`/`Checkpoint` mono-mission, non
+    modifié par ce qui suit et toujours vrai) : `cli._storage` (un
+    `FileStorage`) est partagé entre toutes les invocations `peon run`
+    successives, et `Storage.save_events()` est append-only *pour toujours*,
+    sans aucune notion de Mission. Une `EventLog` rechargée via
+    `Runtime.load_event_log()` pouvait donc porter l'historique de plusieurs
+    Missions bout à bout, et `ContextBuilder.build_from_event_log()` ne
+    filtrait jusque-là aucun `OBSERVATION_PRODUCED` par Mission — les
+    Observations d'une Mission antérieure, déjà terminée et sans rapport,
+    fuyaient dans le `Context` reconstruit pour la reprise de la Mission
+    courante (audit d'isolation multi-Mission). Résolu par
+    `ContextBuilder._current_mission_events(event_log)` : ne retient que les
+    événements survenus depuis le plus récent `MISSION_CREATED` — voir
+    `ARCHITECTURE.md`, section **Context Builder**, et
+    `tests/test_resume_history.py::test_cas5_*`/
+    `tests/test_context_builder_event_log.py`. N'introduit aucune reprise
+    multi-mission (toujours hors périmètre, voir point 27) : corrige
+    uniquement la reconstruction du `Context`, pas la capacité du `Runtime`/
+    `Checkpoint` à suivre plusieurs Missions à la fois. Audit conclu : aucun
+    autre changement de code jugé nécessaire.
+32. `peon run "<goal>"` avec un `goal` vide/blanc ou un `--max-iterations`
+    invalide (`< 1`) laissait fuir une `pydantic.ValidationError` brute
+    (levée par `Mission.__init__`, voir `models/mission.py`) au lieu d'un
+    message et d'un `exit_code=1` propres — même classe de défaut que celui
+    déjà corrigé pour les erreurs `Storage` sur `peon resume` (voir plus
+    haut, `CorruptedCheckpointError`/`CorruptedEventLogError`). Résolu :
+    `cli.py::run` capture désormais `ValidationError` autour de
+    `runtime.run()` et affiche `Invalid mission parameters.` avant de sortir
+    en erreur, même convention que `resume` — voir `ARCHITECTURE.md`,
+    section **CLI**.
 
 ## 6. État actuel d'implémentation
 

@@ -33,6 +33,32 @@ une `Observation` si refusée). `Storage` reste un collaborateur injecté,
 jamais un singleton global : le Runtime fonctionne sans lui, la persistance
 étant simplement indisponible dans ce cas.
 
+**Idempotence durable d'une Action `HIGH` confirmée** *(chantier « Idempotence
+durable d'une Action HIGH après confirmation »)* : `resume_confirmation()`
+rend désormais durable, via un point de persistance interne
+(`_checkpoint_if_configured()`, no-op si aucun `Storage` n'est injecté —
+réutilise tel quel `save_checkpoint()`/`persist_events()`, jamais une
+nouvelle primitive), le fait que la `ConfirmationRequest` est consommée
+**avant** d'exécuter l'Action via l'Executor, puis une seconde fois juste
+après. `pending_confirmation` est donc déjà `None` sur le `Checkpoint` écrit
+sur disque avant que le moindre effet de bord réel ne se produise : un
+`peon resume` ultérieur (après un crash survenu pendant ou juste après
+l'exécution) ne peut plus jamais retrouver la même `ConfirmationRequest`
+encore « en attente » — seule condition qui permettrait de rejouer
+`resume_confirmation()`, donc l'Executor, sur cette même Action. Garantie
+obtenue sans 2ᵉ boucle ReAct, sans modification d'`Executor`/`PolicyEngine`/
+`Workspace`/des Tools, sans SQLite, et sans nouveau champ sur `Checkpoint`
+(compatible avec les Checkpoints déjà existants). Limite assumée plutôt que
+masquée : si le crash survient exactement pendant `Executor.run()` lui-même
+ou pendant l'écriture du second point de persistance (fenêtre résiduelle
+inévitable sans couplage transactionnel avec le Tool, hors périmètre — voir
+`CONTEXT.md`), la Mission reste durablement « garée » (`EXECUTING` ou
+`REASONING` selon le point exact) plutôt que rejouée à l'aveugle — jamais de
+double exécution, mais pas de reprise automatique de la boucle de
+raisonnement pour ce cas précis tant qu'aucune `ConfirmationRequest` n'est en
+attente (limite déjà présente de `cli.py::resume`, pas une régression
+introduite ici — voir **CLI** ci-dessous et `CONTEXT.md`, section 5).
+
 Expose également `save_checkpoint(mission)` (instantané explicite d'un
 **Checkpoint** vers `Storage`, à la demande — même philosophie que
 `persist_events()`, jamais automatique) et `resume_mission(checkpoint)` : un
@@ -100,6 +126,26 @@ première reste utile de façon autonome (tests, composition manuelle). Le
 Reasoner n'a **aucun accès direct** à la Mission, à l'Event Log ni au Tool
 Registry : tout ce qu'il voit transite par le Context que ce composant lui
 remet.
+
+**Isolation multi-Mission de `build_from_event_log`** *(audit d'isolation
+multi-Mission, corrigé)* : `cli._storage` (un `FileStorage`) est partagé
+entre toutes les invocations `peon run` successives — `Storage.save_events()`
+est append-only *pour toujours*, sans aucune notion de Mission, alors que
+`Checkpoint` ne retient toujours que la dernière Mission (mono-mission, voir
+**Checkpoint** ci-dessous). Une `EventLog` rechargée via
+`Runtime.load_event_log()` peut donc porter l'historique de plusieurs
+Missions bout à bout ; `build_from_event_log()` ne filtrait jusque-là aucun
+`OBSERVATION_PRODUCED` par Mission, laissant fuiter dans le `Context`
+reconstruit pour une reprise les Observations d'une Mission antérieure,
+déjà terminée et sans rapport (voir `tests/test_resume_history.py`, Cas 5).
+Corrigé par `ContextBuilder._current_mission_events(event_log)` : ne retient
+que les événements survenus depuis le plus récent `MISSION_CREATED` de
+l'`EventLog` (aucun trouvé — `EventLog` construite à la main par un test, ou
+historique legacy — comportement inchangé, tous les événements considérés
+comme appartenant à la Mission courante). N'implémente pas une reprise
+multi-mission (toujours hors périmètre, voir **Checkpoint** et
+`CONTEXT.md`) : corrige uniquement la reconstruction du `Context` quand un
+même `Storage` a déjà servi à plusieurs Missions séquentielles.
 
 ### Reasoner (ex-Planner)
 Reçoit un `Context`, appelle le LLM, retourne une `Decision` brute et validée
@@ -599,6 +645,18 @@ aussi l'état final (`save_checkpoint()` + `persist_events()`) après avoir
 quitté la boucle, quel que soit le nombre de tours qu'elle a fait — un
 `Checkpoint` sur disque reflète donc toujours l'état courant, jamais une
 pause déjà résolue (voir `tests/test_cli.py::test_resuming_after_a_mission_already_succeeded_does_not_reexecute_the_action`).
+
+**`peon run` avec des paramètres de Mission invalides** *(corrigé)* :
+`Mission(goal=..., max_iterations=...)` valide ces deux champs via Pydantic
+(`goal` non vide/non blanc, `max_iterations >= 1` — voir `models/mission.py`),
+mais rien ne capturait la `ValidationError` résultante avant `runtime.run()` :
+`peon run "   "` ou `peon run "<goal>" --max-iterations 0` laissaient fuir une
+trace Python brute au lieu d'un message et d'un `exit_code=1` propres — même
+défaut que celui déjà corrigé ci-dessus pour les erreurs `Storage` sur
+`resume`. `run` capture désormais `ValidationError` autour de `runtime.run()`
+et affiche `Invalid mission parameters.` suivi du détail Pydantic avant de
+sortir en erreur, même convention que `resume`. Aucun changement à
+`Mission`/`Runtime`/aux règles de validation elles-mêmes.
 
 ## Points d'extension (non implémentés dans le MVP)
 

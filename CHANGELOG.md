@@ -419,10 +419,114 @@
   panne LLM transitoire *apres* une reprise `build_runtime()` + historique
   persiste (`FileStorage`), sans perdre l'observation d'avant redemarrage
   ni rejouer l'Action deja executee.
+- `runtime.py` (chantier « Idempotence durable d'une Action HIGH apres
+  confirmation ») : fenetre de crash residuelle identifiee par audit apres
+  le point precedent (`_drive_to_completion()`) - celui-ci ne couvrait que
+  l'entree/sortie de la boucle d'attente de confirmation, jamais l'interieur
+  de `resume_confirmation()` elle-meme. Entre le moment ou une Action `HIGH`
+  confirmee est reellement executee par l'Executor et le prochain
+  `save_checkpoint()`/`persist_events()` externe (CLI), un crash pouvait
+  laisser sur disque le Checkpoint `AWAITING_CONFIRMATION` d'origine, encore
+  assorti de sa `ConfirmationRequest` deja resolue en memoire - un `peon
+  resume` ulterieur la retrouvait "en attente" et pouvait re-executer la
+  meme Action `HIGH` (ex. `delete_file`) une deuxieme fois. Nouvelle methode
+  privee `Runtime._checkpoint_if_configured(mission)` (no-op si aucun
+  `Storage` n'est injecte, reutilise integralement `save_checkpoint()`/
+  `persist_events()` deja publics - aucune nouvelle primitive de
+  persistance, aucun nouveau champ sur `Checkpoint`), appelee par
+  `resume_confirmation()` immediatement apres avoir consomme la
+  `ConfirmationRequest` (donc `pending_confirmation` deja `None` en
+  memoire) et *avant* `_execute_action()`, puis de nouveau juste apres
+  (execution reussie, echouee, ou confirmation refusee). Un Checkpoint
+  ecrit a ce premier point ne peut plus jamais etre retrouve comme "encore
+  en attente" par une reprise, quel que soit l'instant du crash pendant ou
+  apres l'execution reelle - fermeture structurelle de la fenetre de risque,
+  pas une simple reduction. Limite assumee et documentee (`CONTEXT.md`,
+  section 5, point 30) : si le crash survient exactement pendant
+  `Executor.run()` ou pendant l'ecriture du second point de persistance, la
+  Mission reste "garee" en `EXECUTING`/`REASONING` plutot que rejouee -
+  aucune double execution possible, mais `peon resume` ne relance pas
+  automatiquement la boucle de raisonnement dans ce cas (limite deja
+  existante de `cli.py::resume` en l'absence de `ConfirmationRequest` en
+  attente, inchangee par ce chantier). Aucun changement a `Executor`/
+  `PolicyEngine`/`Workspace`/aux Tools/`Checkpoint`/`Storage`, aucune
+  deuxieme boucle ReAct, aucune dependance SQLite, aucun systeme de retry
+  d'execution de Tool. Comportement des Actions `LOW`/`MEDIUM` (jamais
+  `AWAITING_CONFIRMATION`) strictement inchange : `_checkpoint_if_configured()`
+  n'est cablee que dans `resume_confirmation()`.
+- `tests/test_confirmation_idempotence.py` (nouveau fichier, 9 tests) :
+  crash simule (`_CrashAfterCalls`, decorateur de `Storage` qui leve au
+  N-ieme appel d'une methode donnee) juste apres l'execution reelle d'une
+  Action `HIGH` et avant sa persistance - aucune reexecution possible sur
+  reprise (`InMemoryStorage` puis deux instances `FileStorage` distinctes) ;
+  succes/echec d'execution deja persistes avant un "crash" reconnus
+  durablement sans etre rejoues ; reprise normale sans crash (non
+  regression) ; compatibilite d'un Checkpoint "a l'ancienne" (aucun nouveau
+  champ) ; Actions `LOW`/`MEDIUM` ne declenchant jamais ce nouveau point de
+  persistance (Storage configure pour crasher des le premier appel, jamais
+  atteint) ; une deuxieme Action `HIGH` distincte, plus tard dans la meme
+  Mission, protegee independamment par le meme mecanisme ; scenario bout en
+  bout a deux vrais process Python separes (`subprocess`, ne partageant que
+  le disque) avec le vrai `DeleteFileTool`.
+- `tests/test_integration_delete_file.py` (1 nouveau test) : meme fenetre de
+  crash reproduite avec le vrai `DeleteFileTool`/`LocalWorkspace` (pas un
+  stub) sur un fichier reel - supprime exactement une fois, jamais
+  re-executee apres reprise.
+- `tests/test_cli.py` (1 nouveau test) : meme scenario via `peon run`/`peon
+  resume` reels (`CliRunner`), Storage CLI remplace par un `FileStorage`
+  crashant puis par un `FileStorage` normal sur le meme fichier pour simuler
+  le redemarrage du process.
+- `cli.py` (`run`) : `Mission(goal=..., max_iterations=...)` valide ces deux
+  champs via Pydantic (`goal` non vide/non blanc, `max_iterations >= 1` -
+  voir `models/mission.py`), mais rien ne capturait la `ValidationError`
+  resultante avant `runtime.run()` : `peon run "   "` ou `peon run "..."
+  --max-iterations 0` laissait fuir une trace Python brute au lieu d'un
+  message et d'un `exit_code=1` propres - meme classe de defaut que celui
+  deja corrige pour les erreurs `Storage` sur `resume` (voir plus haut).
+  `run` capture desormais `ValidationError` autour de `runtime.run()` et
+  affiche `Invalid mission parameters.` suivi du detail Pydantic avant de
+  sortir en erreur, meme convention que `resume`. Aucun changement a
+  `Mission`/`Runtime`/aux regles de validation elles-memes.
+- `tests/test_cli.py` (2 nouveaux tests) : `peon run` avec un goal vide/blanc
+  et avec `--max-iterations 0` echouent chacun proprement (`exit_code != 0`,
+  `SystemExit`, message mentionnant le champ en cause) plutot que de laisser
+  remonter une trace Python non geree.
+- `context_builder.py` (audit d'isolation multi-Mission) : risque identifie
+  en auditant le partage d'un meme `Storage` entre plusieurs invocations
+  `peon run` successives (`cli.py`, meme fichier de Checkpoint/EventLog
+  reutilise a chaque commande) - `Storage.save_events()` est append-only
+  *pour toujours*, sans aucune notion de Mission, alors que `Checkpoint` ne
+  retient que la derniere Mission (mono-mission, remplace a chaque
+  `save_checkpoint()`). Une `EventLog` rechargee via
+  `Runtime.load_event_log()` pouvait donc porter l'historique de plusieurs
+  Missions bout a bout, et `ContextBuilder.build_from_event_log()` prenait
+  jusqu'ici tous les evenements `OBSERVATION_PRODUCED` sans filtrage : les
+  Observations d'une Mission anterieure, deja terminee et sans aucun
+  rapport, fuyaient dans le Context reconstruit pour la reprise de la
+  Mission courante. Nouvelle methode privee
+  `ContextBuilder._current_mission_events(event_log)` : ne retient que les
+  evenements survenus depuis le plus recent `MISSION_CREATED` de
+  l'`EventLog` (aucun trouve - EventLog construite a la main par un test,
+  ou historique legacy - comportement inchange, tous les evenements
+  consideres comme appartenant a la Mission courante).
+  `build_from_event_log()` filtre desormais ses `OBSERVATION_PRODUCED` via
+  cette methode avant de construire les `Observation`. Audit conclu :
+  aucun autre changement de code necessaire (`Checkpoint`/`Storage` restent
+  mono-mission par conception, voir `ARCHITECTURE.md`/`CONTEXT.md` - seule
+  la reconstruction du `Context` etait affectee par ce partage de Storage).
+- `tests/test_context_builder_event_log.py` (1 nouveau test) : une
+  `EventLog` portant deux Missions successives (deux `MISSION_CREATED`) ne
+  restitue, via `build_from_event_log()`, que les Observations posterieures
+  au plus recent.
+- `tests/test_resume_history.py` (Cas 5, 1 nouveau test) : deux invocations
+  `peon run` successives sur le meme `FileStorage` (mission A terminee,
+  mission B interrompue en `AWAITING_CONFIRMATION`) - la reprise de la
+  mission B ne voit jamais les Observations de la mission A dans son
+  Context reconstruit.
 
 ### Tests
 
-441 passing
+456 passing
 
 ## 0.1.0
 

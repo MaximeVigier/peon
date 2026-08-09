@@ -29,7 +29,7 @@ from peon.models.mission import Mission, MissionStatus
 from peon.models.tool_result import ToolResult
 from peon.models.tool_spec import RiskLevel, ToolSpec
 from peon.providers.ollama import OllamaLLM
-from peon.storage import FileStorage, InMemoryStorage
+from peon.storage import FileStorage, InMemoryStorage, Storage
 from peon.tools.base import Tool
 
 runner = CliRunner()
@@ -135,6 +135,45 @@ def test_run_nominal_path_with_an_action_then_finish(monkeypatch: pytest.MonkeyP
     assert result.exit_code == 0
     assert tool.call_count == 1
     assert "Mission succeeded" in result.output
+
+
+# --- peon run : goal invalide -----------------------------------------------------
+
+
+def test_run_with_a_blank_goal_fails_cleanly_instead_of_a_raw_validation_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression : `Mission(goal=...)` (models/mission.py) rejette un goal
+    # vide/blanc via un validator Pydantic (ValueError -> ValidationError),
+    # mais rien ne capturait cette exception cote CLI avant `runtime.run()` :
+    # `peon run "   "` laissait fuir une trace Python brute (ValidationError)
+    # au lieu d'un message et d'un exit_code=1 propres, contrairement au
+    # traitement deja en place pour les erreurs Storage (voir
+    # test_resume_with_a_corrupted_checkpoint_file_fails_cleanly ci-dessous).
+    _use_llm(monkeypatch, [])
+    _use_tools(monkeypatch, [])
+
+    result = runner.invoke(app, ["run", "   "])
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, SystemExit)  # sortie propre, pas une trace Python non geree
+    assert "goal" in result.output.lower()
+
+
+def test_run_with_an_invalid_max_iterations_fails_cleanly_instead_of_a_raw_validation_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Meme classe de bug que ci-dessus, via un deuxieme champ valide par
+    # Mission (max_iterations >= 1) mais jamais par la CLI elle-meme :
+    # `--max-iterations 0` levait la meme ValidationError brute.
+    _use_llm(monkeypatch, [])
+    _use_tools(monkeypatch, [])
+
+    result = runner.invoke(app, ["run", "objectif valide", "--max-iterations", "0"])
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, SystemExit)
+    assert "max_iterations" in result.output.lower() or "max-iterations" in result.output.lower()
 
 
 # --- peon run : confirmation ------------------------------------------------------
@@ -361,6 +400,83 @@ def test_resume_uses_the_checkpoint_mechanism(monkeypatch: pytest.MonkeyPatch) -
     assert "Tool: run_command" in result.output
     assert tool.call_count == 1
     assert "Mission succeeded" in result.output
+
+
+class _SimulatedCrash(Exception):
+    pass
+
+
+class _CrashAfterCalls(Storage):
+    # Simule un arret brutal du process au N-ieme appel de `crash_method` :
+    # les appels precedents atterrissent normalement sur le Storage
+    # enveloppe, celui-la leve avant d'y toucher - meme convention que
+    # tests/test_confirmation_idempotence.py (chantier « Idempotence durable
+    # d'une Action HIGH apres confirmation »), duplique ici plutot
+    # qu'importe : chaque module de test de ce projet reste autonome.
+    def __init__(self, wrapped: Storage, *, crash_method: str, crash_on_call: int) -> None:
+        self._wrapped = wrapped
+        self._crash_method = crash_method
+        self._crash_on_call = crash_on_call
+        self._calls: dict[str, int] = {"save_checkpoint": 0, "save_events": 0}
+
+    def _maybe_crash(self, method: str) -> None:
+        self._calls[method] += 1
+        if method == self._crash_method and self._calls[method] == self._crash_on_call:
+            raise _SimulatedCrash(f"simulated crash on {method} call #{self._calls[method]}")
+
+    def save_events(self, events):
+        self._maybe_crash("save_events")
+        self._wrapped.save_events(events)
+
+    def load_events(self):
+        return self._wrapped.load_events()
+
+    def save_checkpoint(self, checkpoint):
+        self._maybe_crash("save_checkpoint")
+        self._wrapped.save_checkpoint(checkpoint)
+
+    def load_checkpoint(self):
+        return self._wrapped.load_checkpoint()
+
+
+def test_run_crashing_right_after_a_granted_high_confirmation_never_reexecutes_on_resume(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Reproduit la fenetre de risque du chantier « Idempotence durable d'une
+    # Action HIGH apres confirmation » au niveau CLI : `peon run` "crashe"
+    # juste apres avoir reellement execute l'Action HIGH confirmee, avant que
+    # cette execution ne soit elle-meme persistee. `_drive_to_completion`
+    # sauvegarde un premier Checkpoint (AWAITING_CONFIRMATION) avant de
+    # demander la confirmation (appel #1 a save_checkpoint) ;
+    # `resume_confirmation()` en sauvegarde un deuxieme juste avant d'executer
+    # l'Action (appel #2, doit reussir pour clore la fenetre) puis un
+    # troisieme juste apres (appel #3, ou le crash est simule ici).
+    checkpoint_path = tmp_path / "checkpoint.json"
+    crashing_storage = _CrashAfterCalls(FileStorage(checkpoint_path), crash_method="save_checkpoint", crash_on_call=3)
+    monkeypatch.setattr(cli, "_storage", crashing_storage)
+
+    tool = _StubTool("run_command", RiskLevel.HIGH, ToolResult(success=True, output="ok"))
+    _use_tools(monkeypatch, [tool])
+    _use_llm(
+        monkeypatch,
+        [_action_response("run_command", command="echo hi"), _finish_response("success", "commande executee")],
+    )
+
+    first = runner.invoke(app, ["run", "executer une commande"], input="y\n")
+
+    assert isinstance(first.exception, _SimulatedCrash)
+    assert tool.call_count == 1  # executee malgre le "crash" simule juste apres
+
+    # "Redemarrage" du process CLI : nouveau Storage non-crashant sur les
+    # memes donnees deja atterries sur disque avant le crash simule.
+    monkeypatch.setattr(cli, "_storage", FileStorage(checkpoint_path))
+    _use_llm(monkeypatch, [_finish_response("success", "ne devrait jamais etre appele")])
+
+    second = runner.invoke(app, ["resume"], input="y\n")
+
+    assert second.exit_code == 0
+    assert tool.call_count == 1  # toujours 1 : aucune reexecution
+    assert "no pending confirmation" in second.output.lower()
 
 
 def test_resume_finds_a_checkpoint_persisted_to_disk_by_a_separate_storage_instance(

@@ -13,21 +13,60 @@ de la Mission.
 from pathlib import Path
 from typing import Literal
 
+import pytest
+
 from peon.context_builder import ContextBuilder
 from peon.event_log import EventLog
 from peon.executor import Executor
+from peon.models.checkpoint import Checkpoint
 from peon.models.confirmation import ConfirmationResponse
 from peon.models.context import Context
 from peon.models.decision import ActionDecision, Decision, FinishDecision
+from peon.models.events import Event
 from peon.models.mission import MissionStatus
 from peon.models.observation import ObservationKind
 from peon.policy import PolicyEngine
 from peon.reasoner import Reasoner
-from peon.runtime import Runtime
-from peon.storage import InMemoryStorage
+from peon.runtime import Runtime, UnknownConfirmationRequestError
+from peon.storage import InMemoryStorage, Storage
 from peon.tool_registry import ToolRegistry
 from peon.tools.filesystem import DeleteFileTool
 from peon.workspace import LocalWorkspace
+
+
+class _SimulatedCrash(Exception):
+    pass
+
+
+class _CrashAfterCalls(Storage):
+    # Meme convention que tests/test_confirmation_idempotence.py (chantier
+    # « Idempotence durable d'une Action HIGH apres confirmation ») : simule
+    # un arret brutal du process au N-ieme appel de `crash_method`, sans
+    # importer le module de test dedie (chaque module reste autonome).
+    def __init__(self, wrapped: Storage, *, crash_method: str, crash_on_call: int) -> None:
+        self._wrapped = wrapped
+        self._crash_method = crash_method
+        self._crash_on_call = crash_on_call
+        self._calls: dict[str, int] = {"save_checkpoint": 0, "save_events": 0}
+
+    def _maybe_crash(self, method: str) -> None:
+        self._calls[method] += 1
+        if method == self._crash_method and self._calls[method] == self._crash_on_call:
+            raise _SimulatedCrash(f"simulated crash on {method} call #{self._calls[method]}")
+
+    def save_events(self, events: list[Event]) -> None:
+        self._maybe_crash("save_events")
+        self._wrapped.save_events(events)
+
+    def load_events(self) -> list[Event]:
+        return self._wrapped.load_events()
+
+    def save_checkpoint(self, checkpoint: Checkpoint) -> None:
+        self._maybe_crash("save_checkpoint")
+        self._wrapped.save_checkpoint(checkpoint)
+
+    def load_checkpoint(self) -> Checkpoint | None:
+        return self._wrapped.load_checkpoint()
 
 
 class _DeleteThenFinishReasoner(Reasoner):
@@ -158,4 +197,54 @@ def test_delete_file_confirmation_survives_a_checkpoint_and_resume_on_a_new_runt
     )
 
     assert result.status is MissionStatus.SUCCEEDED
+    assert not target.exists()
+
+
+def test_delete_file_is_never_executed_twice_when_the_process_crashes_right_after_deleting(tmp_path: Path) -> None:
+    # Le scenario concret cite par le chantier « Idempotence durable d'une
+    # Action HIGH apres confirmation » : delete_file execute une premiere
+    # fois, puis un crash simule juste apres (avant la persistance de cette
+    # execution) - une reprise ulterieure ne doit jamais retrouver la
+    # ConfirmationRequest d'origine comme encore "en attente" et donc ne
+    # jamais retenter la suppression.
+    target = tmp_path / "mission.txt"
+    target.write_text("contenu reel du fichier", encoding="utf-8")
+    storage = _CrashAfterCalls(InMemoryStorage(), crash_method="save_checkpoint", crash_on_call=2)
+
+    runtime = _runtime(_registry(), _DeleteThenFinishReasoner(str(target)), storage=storage)
+    mission = runtime.run(f"supprimer {target.name}")
+    request_id = runtime.pending_confirmation.id
+
+    with pytest.raises(_SimulatedCrash):
+        runtime.resume_confirmation(mission, ConfirmationResponse(request_id=request_id, granted=True))
+
+    # Le fichier a bien ete reellement supprime avant que la persistance de
+    # cette suppression ne "crashe".
+    assert not target.exists()
+
+    underlying_storage = storage._wrapped
+    persisted = underlying_storage.load_checkpoint()
+    assert persisted.pending_confirmation is None
+    assert persisted.mission.status is MissionStatus.EXECUTING
+
+    # "Nouveau process" : nouveau Runtime avec l'EventLog reconstruit depuis
+    # le Storage non-crashant, comme test_delete_file_confirmation_survives_a_checkpoint_and_resume_on_a_new_runtime
+    # ci-dessus mais avec l'historique persiste en plus.
+    reloaded_event_log = Runtime.load_event_log(underlying_storage)
+    registry = _registry()
+    runtime_b = Runtime(
+        context_builder=ContextBuilder(registry),
+        reasoner=_FinishReasoner(),
+        policy_engine=PolicyEngine(registry),
+        executor=Executor(registry),
+        event_log=reloaded_event_log,
+        storage=underlying_storage,
+    )
+    resumed_mission = runtime_b.resume_mission(persisted)
+
+    assert runtime_b.pending_confirmation is None
+    with pytest.raises(UnknownConfirmationRequestError):
+        runtime_b.resume_confirmation(resumed_mission, ConfirmationResponse(request_id=request_id, granted=True))
+
+    # Toujours supprime une seule fois : aucune reprise n'a retente l'Action.
     assert not target.exists()

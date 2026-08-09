@@ -331,6 +331,73 @@ def test_cas4_retry_still_recovers_from_a_transient_llm_failure_after_a_resume(t
     assert runtime_b.observations[1].kind is ObservationKind.EXECUTION_RESULT
 
 
+# --- Cas 5 : deux missions successives partageant le meme Storage -------------
+
+
+def test_cas5_resuming_a_second_mission_never_mixes_in_observations_from_a_previous_completed_mission(
+    tmp_path: Path,
+) -> None:
+    """Deux invocations `peon run` successives (deux Runtime distincts, meme
+    FileStorage partage comme le fait cli.py._storage) : la premiere mission se
+    termine normalement, la seconde est interrompue en AWAITING_CONFIRMATION
+    puis reprise. `FileStorage.save_events()` est append-only *pour toujours*
+    (pas de notion de mission), alors que `Checkpoint` ne retient que la
+    derniere Mission (mono-mission, remplace a chaque `save_checkpoint()`) :
+    sans filtrage par mission a la reconstruction du Context, les Observations
+    de la mission A (deja terminee, sans aucun rapport) restent visibles dans
+    le Context reconstruit pour la reprise de la mission B.
+    """
+    checkpoint_path = tmp_path / "checkpoint.json"
+    storage = FileStorage(checkpoint_path)
+    registry = _registry()
+
+    runtime_a, _ = _runtime(
+        registry,
+        _ScriptedReasoner(
+            [
+                ActionDecision(reasoning="lire config a", tool_name="read_config", arguments={}),
+                FinishDecision(outcome="success", summary="A fini", confidence=1.0),
+            ]
+        ),
+        storage=storage,
+    )
+    mission_a = runtime_a.run("mission A - jamais liee a la mission B")
+    assert mission_a.status is MissionStatus.SUCCEEDED
+    # Persistance de l'etat final, comme le fait cli.py::_drive_to_completion
+    # apres la boucle (pas seulement a l'entree d'AWAITING_CONFIRMATION).
+    runtime_a.save_checkpoint(mission_a)
+    runtime_a.persist_events()
+    del runtime_a
+
+    # Mission B : nouveau Runtime, EventLog() vierge par defaut (comme
+    # build_runtime()/cli.py::run, qui ne passe jamais event_log= pour `run`),
+    # meme Storage partage que la mission A.
+    runtime_b, _ = _runtime(
+        registry,
+        _ScriptedReasoner([ActionDecision(reasoning="deployer", tool_name="deploy", arguments={})]),
+        storage=storage,
+    )
+    mission_b = runtime_b.run("mission B - independante de A")
+    assert mission_b.status is MissionStatus.AWAITING_CONFIRMATION
+    assert runtime_b.observations == []  # deploy declenche la confirmation avant toute Observation
+    runtime_b.save_checkpoint(mission_b)
+    runtime_b.persist_events()
+    del runtime_b
+
+    # "peon resume" : recharge le Storage partage, comme cli.py::resume.
+    checkpoint = storage.load_checkpoint()
+    reloaded_event_log = Runtime.load_event_log(storage)
+    runtime_c, _ = _runtime(registry, _ScriptedReasoner([]), storage=storage, event_log=reloaded_event_log)
+    resumed_mission = runtime_c.resume_mission(checkpoint)
+
+    assert resumed_mission.goal == "mission B - independante de A"
+    # Seule la mission B est en cours de reprise : aucune Observation de la
+    # mission A (deja terminee) ne doit fuiter dans son Context reconstruit.
+    assert runtime_c.observations == []
+    assert runtime_c.pending_confirmation is not None
+    assert runtime_c.pending_confirmation.action.tool_name == "deploy"
+
+
 # --- Round-trip EventLog / absence de duplication / robustesse ----------------
 
 

@@ -86,6 +86,33 @@ def test_build_from_event_log_ignores_non_observation_events() -> None:
     assert context.observations == [observation]
 
 
+def test_build_from_event_log_scopes_observations_to_the_most_recent_mission_created() -> None:
+    # Reproduit ce que produit un FileStorage partage entre deux invocations
+    # `peon run` successives (voir tests/test_resume_history.py, cas 5) :
+    # l'EventLog rechargee peut porter l'historique de plusieurs Missions bout
+    # a bout (Storage.save_events() est append-only pour toujours, sans notion
+    # de Mission), jamais une seule. Seuls les evenements de la Mission la plus
+    # recente (apres le dernier MISSION_CREATED) doivent alimenter le Context.
+    mission_a_observation = Observation(kind=ObservationKind.EXECUTION_RESULT, summary="mission A terminee")
+    mission_b_observation = Observation(kind=ObservationKind.EXECUTION_RESULT, summary="mission B en cours")
+    event_log = EventLog()
+    event_log.append(Event(type=EventType.MISSION_CREATED, payload={"mission_id": str(uuid.uuid4()), "goal": "A"}))
+    event_log.append(_observation_event(mission_a_observation))
+    event_log.append(Event(type=EventType.MISSION_SUCCEEDED, payload={"summary": "A fini"}))
+    event_log.append(Event(type=EventType.MISSION_CREATED, payload={"mission_id": str(uuid.uuid4()), "goal": "B"}))
+    event_log.append(_observation_event(mission_b_observation))
+    builder = ContextBuilder(_registry())
+
+    context = builder.build_from_event_log(
+        mission_goal="B",
+        mission_status=MissionStatus.REASONING,
+        mission_iteration_count=1,
+        event_log=event_log,
+    )
+
+    assert context.observations == [mission_b_observation]
+
+
 @pytest.mark.parametrize(
     "payload",
     [

@@ -31,6 +31,7 @@ confirmation.
 from pathlib import Path
 
 import typer
+from pydantic import ValidationError
 from rich.console import Console
 
 from peon import __version__
@@ -187,7 +188,17 @@ def run(
 ) -> None:
     """Lance une mission jusqu'a son etat final, confirmations gerees en direct."""
     runtime = _build_cli_runtime(model, base_url, timeout_seconds, workspace_root)
-    mission = runtime.run(goal, max_iterations=max_iterations)
+    # Mission (models/mission.py) valide goal/max_iterations via Pydantic (goal
+    # non vide, max_iterations >= 1) : une valeur CLI invalide levait jusque-la
+    # une ValidationError brute au lieu d'un message et d'un exit_code=1
+    # propres, contrairement au traitement deja en place pour les erreurs
+    # Storage ci-dessous (`resume`). Meme convention ici : message explicite,
+    # sortie propre.
+    try:
+        mission = runtime.run(goal, max_iterations=max_iterations)
+    except ValidationError as exc:
+        console.print(f"[bold red]Invalid mission parameters.[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
     mission = _drive_to_completion(runtime, mission)
     _print_final_status(mission)
 
